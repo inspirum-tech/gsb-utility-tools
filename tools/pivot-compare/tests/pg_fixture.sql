@@ -2,15 +2,15 @@
 -- and the NEW tall table (timestamptz). Same fake values as make_fake_data*.sql, plus one large, precise number.
 CREATE SCHEMA gsb_data_kpi_pivot;
 CREATE SCHEMA gsb_data_kpi_base;
-CREATE TABLE gsb_data_kpi_pivot."KPI_TEST_QRLY_CELL_LTE_ERS_P" (
+CREATE TABLE gsb_data_kpi_pivot."KPI_APP_TEST_QRLY_CELL_LTE_ERS_P" (
   "PERIOD_START_TIME" timestamp NOT NULL, "SITE_ID" integer, "CELL_ID" integer, "SITE_NAME" varchar, "CELL_NAME" varchar,
   "LAC" numeric, "UPDATE_TIMESTAMP" timestamp, "K_1" numeric, "K_2" numeric, "K_3" numeric, "K_4" numeric, "K_9" numeric
 ) PARTITION BY RANGE ("PERIOD_START_TIME");
-CREATE TABLE gsb_data_kpi_pivot."KPI_TEST_QRLY_CELL_LTE_ERS_P_P_20251219_2000" PARTITION OF gsb_data_kpi_pivot."KPI_TEST_QRLY_CELL_LTE_ERS_P"
+CREATE TABLE gsb_data_kpi_pivot."KPI_APP_TEST_QRLY_CELL_LTE_ERS_P_P_20251219_2000" PARTITION OF gsb_data_kpi_pivot."KPI_APP_TEST_QRLY_CELL_LTE_ERS_P"
   FOR VALUES FROM ('2025-12-19 20:00:00') TO ('2025-12-19 20:15:00');
-CREATE TABLE gsb_data_kpi_pivot."KPI_TEST_QRLY_CELL_LTE_ERS_P_P_20251219_2015" PARTITION OF gsb_data_kpi_pivot."KPI_TEST_QRLY_CELL_LTE_ERS_P"
+CREATE TABLE gsb_data_kpi_pivot."KPI_APP_TEST_QRLY_CELL_LTE_ERS_P_P_20251219_2015" PARTITION OF gsb_data_kpi_pivot."KPI_APP_TEST_QRLY_CELL_LTE_ERS_P"
   FOR VALUES FROM ('2025-12-19 20:15:00') TO ('2025-12-19 20:30:00');
-INSERT INTO gsb_data_kpi_pivot."KPI_TEST_QRLY_CELL_LTE_ERS_P" VALUES
+INSERT INTO gsb_data_kpi_pivot."KPI_APP_TEST_QRLY_CELL_LTE_ERS_P" VALUES
   ('2025-12-19 20:00:00', 1, 1, 's1', 'c11', 5, now(), 10, 20, 0.123456785, 1234567.12345678, 1),
   ('2025-12-19 20:00:00', 1, 2, 's1', 'c12', 5, now(), 50, 21, 31, 0.5, 1),
   ('2025-12-19 20:00:00', 2, 1, 's2', 'c21', 5, now(), 5, NULL, -1, 0.5, 1),
@@ -31,3 +31,13 @@ FROM (VALUES
 INSERT INTO gsb_data_kpi_base."KPI_CALCULATED" VALUES
   ('2025-12-19 09:00:00+00', 1, 1, 1, 999.0, 'OTHER_APP'),
   ('2025-12-19 09:15:00+00', 9, 9, 1, 1.0, 'APP_TEST');
+
+CREATE SCHEMA gsb_data;
+CREATE TABLE gsb_data."KPI_DEFINITION" (
+  "KPI_ID" numeric, "APPLICATION" varchar, "TIME_AGGREGATE" varchar, "NETWORK_LEVEL" varchar, "TECHNOLOGY" varchar, "VENDOR" varchar);
+INSERT INTO gsb_data."KPI_DEFINITION" VALUES
+  (1, 'APP_TEST', 'Q', 'CELL', 'LTE', 'ERS'), (2, 'APP_TEST', 'Q', 'CELL', 'LTE', 'ERS'),
+  (3, 'APP_TEST', 'Q', 'CELL', 'LTE', 'ERS'), (4, 'APP_TEST', 'Q', 'CELL', 'LTE', 'ERS'),
+  (9, 'APP_TEST', 'Q', 'CELL', 'LTE', 'ERS'),
+  (8, 'APP_TEST', 'Q', 'CELL', 'NB-IoT', 'ERS'),
+  (40, 'OTHER_APP', 'Q', 'CELL', 'LTE', 'ERS');

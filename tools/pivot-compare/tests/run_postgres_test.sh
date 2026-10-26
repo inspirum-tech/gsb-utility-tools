@@ -19,7 +19,22 @@ docker exec -i pc_pg psql -U postgres -d gsb -v ON_ERROR_STOP=1 -q < tests/pg_fi
 OLD_SOURCE=postgres
 OLD_DSN_ENV=PIVOT_COMPARE_TEST_DSN
 OLD_SCHEMA=gsb_data_kpi_pivot
-OLD_TABLE=KPI_TEST_QRLY_CELL_LTE_ERS_P
+OLD_TABLE=KPI_APP_TEST_QRLY_CELL_LTE_ERS_P
+MODE=auto
+AUTO_APPLICATIONS=APP_TEST
+DEF_SOURCE=postgres
+DEF_DSN_ENV=PIVOT_COMPARE_TEST_DSN
+DEF_SCHEMA=gsb_data
+DEF_TABLE=KPI_DEFINITION
+DEF_COL_KPI_ID=KPI_ID
+DEF_COL_APPLICATION=APPLICATION
+DEF_COL_RESOLUTION=TIME_AGGREGATE
+DEF_COL_LEVEL=NETWORK_LEVEL
+DEF_COL_TECHNOLOGY=TECHNOLOGY
+DEF_COL_VENDOR=VENDOR
+AUTO_OLD_TABLE_PATTERN=KPI_{APPLICATION}_{RES}_{LEVEL}_{TECH}_{VENDOR}_P
+AUTO_RES_TOKENS=Q=QRLY,H=HRLY,D=DAILY
+AUTO_KPI_PREFIX=K_
 NEW_SOURCE=postgres
 NEW_DSN_ENV=PIVOT_COMPARE_TEST_DSN
 NEW_SCHEMA=gsb_data_kpi_base
@@ -29,7 +44,8 @@ EOF
 } > "$W/pg.env"
 export PIVOT_COMPARE_TEST_DSN="host=localhost port=55432 dbname=gsb user=postgres password=t"
 ./run.sh "$W/pg.env"; code=$?
-echo "exit code: $code (1 = DIFFERENT is expected: the fake data has known differences)"
-echo "differences.csv:"; cat "$W/report/differences.csv"
-echo "objects_one_side.csv:"; cat "$W/report/objects_one_side.csv"
-echo "duplicate_keys.csv:"; cat "$W/report/duplicate_keys.csv"
+echo "exit code: $code (1 = DIFFERENT is expected: the fake data has known differences; AUTO mode)"
+echo "families_summary.csv:"; cat "$W/report/families_summary.csv"
+echo "differences.csv:"; cat "$W/report/KPI_APP_TEST_QRLY_CELL_LTE_ERS_P/differences.csv"
+echo "objects_one_side.csv:"; cat "$W/report/KPI_APP_TEST_QRLY_CELL_LTE_ERS_P/objects_one_side.csv"
+echo "duplicate_keys.csv:"; cat "$W/report/KPI_APP_TEST_QRLY_CELL_LTE_ERS_P/duplicate_keys.csv"

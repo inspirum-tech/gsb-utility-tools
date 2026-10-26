@@ -92,6 +92,25 @@ code=$(run H)
 check "exit code (2 = bad setup)" 2 "$code"
 check "the message says why" 1 "$(grep -c 'letters, digits' "$W/H.out")"
 
+echo "I. AUTO mode: the families and their old tables are found from the KPI definitions"
+variant I MODE=auto AUTO_APPLICATIONS=APP_TEST DEF_SOURCE=duckdb DEF_DB_FILE=$W/new.duckdb DEF_SCHEMA=main DEF_TABLE=KPI_DEFINITION   DEF_DSN_ENV= DEF_CATALOG= AUTO_KPI_PREFIX=K_   'AUTO_OLD_TABLE_PATTERN=KPI_{APPLICATION}_{RES}_{LEVEL}_{TECH}_{VENDOR}_P' 'AUTO_RES_TOKENS=Q=QRLY,H=HRLY,D=DAILY'   DEF_COL_KPI_ID=KPI_ID DEF_COL_APPLICATION=APPLICATION DEF_COL_RESOLUTION=TIME_AGGREGATE DEF_COL_LEVEL=NETWORK_LEVEL   DEF_COL_TECHNOLOGY=TECHNOLOGY DEF_COL_VENDOR=VENDOR
+code=$(run I); R=$W/report_I
+check "exit code (1 = at least one family DIFFERENT)" 1 "$code"
+check "families found (5G, LTE, NR; not the OTHER_APP one, not the one without technology)" 3 "$(rows $R/families.csv)"
+check "family KPI ids listed (1,2,3,9 LTE; 8 5G; 20 NR)" 6 "$(rows $R/family_kpis.csv)"
+res() { "$DUCKDB" -csv -noheader -c "SELECT result FROM read_csv('$R/families_summary.csv') WHERE family = '$1'"; }
+check "5G family" IDENTICAL "$(res KPI_APP_TEST_QRLY_CELL_5G_ERS_P)"
+check "LTE family" DIFFERENT "$(res KPI_APP_TEST_QRLY_CELL_LTE_ERS_P)"
+check "NR family (no old table)" SKIPPED "$(res KPI_APP_TEST_QRLY_CELL_NR_ERS_P)"
+check "the _BKP copy was not compared" 0 "$(ls $R | grep -c BKP)"
+RL=$R/KPI_APP_TEST_QRLY_CELL_LTE_ERS_P
+check "LTE: objects only in old" 1 "$(metric $RL only_old_objects)"
+check "LTE: objects only in new" 1 "$(metric $RL only_new_objects)"
+check "LTE: values different" 1 "$(metric $RL values_different)"
+check "LTE: NULL in old only" 1 "$(metric $RL values_null_old_only)"
+check "LTE: KPI columns only in new (other family's K_8 is not counted)" 0 "$(metric $RL only_new_kpi_columns)"
+check "5G: objects only in old and new" 0 "$(( $(metric $R/KPI_APP_TEST_QRLY_CELL_5G_ERS_P only_old_objects) + $(metric $R/KPI_APP_TEST_QRLY_CELL_5G_ERS_P only_new_objects) ))"
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

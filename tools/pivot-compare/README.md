@@ -29,13 +29,38 @@ PERIOD_START_TIME     SITE_ID CELL_ID  K_1   K_2       PERIOD_START_TIME     SIT
 One line summary: *both sides are reduced to (period, object key, KPI, value), joined, and every pair is judged equal
 or different by the tolerance and the Java null/NaN/infinity rule.*
 
+## Two modes: you name nothing (auto) or you name one table (manual)
+
+* **`MODE=auto` (default in `config.env`).** You set only the **period** and the **applications** (`AUTO_APPLICATIONS=ENIQS_CAT6`,
+  or `ALL`). The tool reads the KPI definitions (`gsb_data."KPI_DEFINITION"`) and groups the KPIs into **families**
+  (application, resolution, level, technology, vendor), exactly as the new engine does when it names a pivot table.
+  Each family gives one old table name, for example `KPI_ENIQS_CAT6_QRLY_CELL_LTE_ERS_P`
+  (rule in `AUTO_OLD_TABLE_PATTERN`; `Q` becomes `QRLY`; `NB-IoT` becomes `NB_IOT`). For each family whose old table exists
+  it compares the old table with the new rows **of that family's KPI ids only**, so a 5G cell never shows up as
+  "missing" in the LTE comparison. A family without an old table is listed as `SKIPPED`. Backup and test copies
+  (`_BKP`, `_TEST`, per-period partitions) are never picked up because only the exact rule name is looked for.
+* **`MODE=manual`.** You name `OLD_TABLE` and the filter on the new side yourself and get one comparison.
+
 ## How to run
 
 ```bash
 cd tools/pivot-compare
-$EDITOR config.env           # period, tables, filter (see the comments in the file)
+$EDITOR config.env           # period and applications (see the comments in the file)
 ./run.sh                     # or: ./run.sh path/to/other-config.env
 ```
+
+In auto mode the screen shows one line per family and a total:
+
+```
+  KPI_ENIQS_CAT6_QRLY_CELL_LTE_ERS_P      DIFFERENT
+      DIFFERENT: objects only old=... values compared=... different=...
+  KPI_ENIQS_CAT6_QRLY_CELL_NB_IOT_ERS_P   SKIPPED (no old table; 1 KPIs defined)
+families found: 3   compared: 2   skipped (no old table): 1   different: 1   not comparable: 0   errors: 0
+```
+
+`REPORT_DIR/families_summary.csv` has the same list, and every family has its own folder `REPORT_DIR/<family>/` with the
+files described below (plus `screen.txt`, the full on-screen summary of that family). `REPORT_DIR/families.csv` lists
+the families that were found and `family_kpis.csv` the KPI ids of each.
 
 Needs `bash` and the `duckdb` command line program (set `DUCKDB=/full/path/duckdb` in the config if it is not on the
 `PATH`). For a Postgres side it needs the connection string in the environment variable named by `OLD_DSN_ENV` /
@@ -43,6 +68,7 @@ Needs `bash` and the `duckdb` command line program (set `DUCKDB=/full/path/duckd
 `../../.env`, the project `.env`). It is never printed or written to the report.
 
 Exit code: `0` IDENTICAL, `1` DIFFERENT, `3` NOT COMPARABLE (no object or no KPI column in common), `2` bad setup.
+In auto mode: `1` if any family is DIFFERENT, `2` on an error, `3` if nothing could be compared, else `0`.
 
 ### On the dev server
 
@@ -106,7 +132,8 @@ Copy `config.env` and change:
 
 | To compare | Change |
 |---|---|
-| another family (for example 5G or STD) | `OLD_TABLE`, `NEW_FILTER_VALUE` (the application), `KPI_REGEX` if the names differ |
+| other applications or families | auto: `AUTO_APPLICATIONS=ENIQS_CAT6,ENIQS_CAT2N3` or `ALL`; manual: `OLD_TABLE`, `NEW_FILTER_VALUE` |
+| a different table naming rule | `AUTO_OLD_TABLE_PATTERN`, `AUTO_RES_TOKENS` |
 | another period | `PERIOD_FROM`, `PERIOD_TO` (UTC, `PERIOD_TO` not included) |
 | site level instead of cell | `OLD_KEY_COLS`, `NEW_KEY_COLS` (same count, same order) |
 | a new **pivot** table (DuckLake) instead of the tall table | `NEW_SHAPE=wide`, `NEW_SOURCE=attached`, `NEW_CATALOG=gsb`, `NEW_SCHEMA=gsb_data_kpi_pivot`, `NEW_TABLE=<pivot table>`, `NEW_KEY_COLS`, `NEW_PERIOD_KIND` |

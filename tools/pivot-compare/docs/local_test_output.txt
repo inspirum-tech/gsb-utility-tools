@@ -1,4 +1,4 @@
-# command: DUCKDB=duckdb tests/run_local_tests.sh   (DuckDB CLI v1.5.4, Windows, 2026-10-26)
+# command: DUCKDB=duckdb tests/run_local_tests.sh   (DuckDB CLI v1.5.4, Windows, 2026-10-26, includes AUTO mode test I)
 A. all known differences (strict verdict)
   ok    exit code (1 = DIFFERENT) = 1
   ok    verdict line starts with = DIFFERENT
@@ -40,6 +40,20 @@ G. NaN rule switched off -> NaN against -1 is a difference
 H. a table name with something other than letters, digits and _ is refused
   ok    exit code (2 = bad setup) = 2
   ok    the message says why = 1
+I. AUTO mode: the families and their old tables are found from the KPI definitions
+  ok    exit code (1 = at least one family DIFFERENT) = 1
+  ok    families found (5G, LTE, NR; not the OTHER_APP one, not the one without technology) = 3
+  ok    family KPI ids listed (1,2,3,9 LTE; 8 5G; 20 NR) = 6
+  ok    5G family = IDENTICAL
+  ok    LTE family = DIFFERENT
+  ok    NR family (no old table) = SKIPPED
+  ok    the _BKP copy was not compared = 0
+  ok    LTE: objects only in old = 1
+  ok    LTE: objects only in new = 1
+  ok    LTE: values different = 1
+  ok    LTE: NULL in old only = 1
+  ok    LTE: KPI columns only in new (other family's K_8 is not counted) = 0
+  ok    5G: objects only in old and new = 0
 
-passed: 33   failed: 0
+passed: 46   failed: 0
 # exit code: 0

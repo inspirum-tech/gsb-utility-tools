@@ -57,6 +57,23 @@ period_utc,object_key,kpi,old_value,new_value,abs_diff,kind
 
 (`only old=2` here because the Postgres fixture also holds one row with NULL site and cell, shown as `<NULL>|<NULL>`.) ✅
 
+## C2. AUTO mode (the tables are found from the KPI definitions)
+
+Facts found on dev first:
+
+| # | Claim | Verbatim result | Verdict |
+|---|---|---|---|
+| 12 | The KPI definitions are in `gsb_data."KPI_DEFINITION"` with `KPI_ID, KPI_NAME, NETWORK_LEVEL, TIME_AGGREGATE, TECHNOLOGY, VENDOR, APPLICATION` | 10 rows listed (also backups `KPI_DEFINITION_13Nov`, `..._BACKUP_20261019`, ... and `gsb_data_UAT."KPI_DEFINITION"`) | ✅ |
+| 13 | `ENIQS_CAT6` splits into 3 families | `ENIQS_CAT6 \| Q \| CELL \| 5G \| ERS \| 765 \| 241326 \| 500002`; `... \| LTE \| ERS \| 386 \| 259564 \| 600025`; `... \| NB-IoT \| ERS \| 1 \| 600024 \| 600024` | ✅ |
+
+Tests: local test I (`docs/local_test_output.txt`, 46 of 46 checks, includes: 5G family IDENTICAL, LTE family DIFFERENT, NR family
+SKIPPED, the `_BKP` copy not compared, other application and a definition without technology left out, the other family's KPI not
+counted as a missing column) and the Postgres test in auto mode (`docs/postgres_test_output.txt`: the old table is found in
+Postgres, `NB-IoT` gives `..._NB_IOT_ERS_P` which has no old table and is `SKIPPED`). ✅
+
+⏳ Not yet tried on dev: the name rule against the real old tables of every ENIQS family (for example whether the old NB-IoT table
+is really called `..._NB_IOT_ERS_P`; on dev the schema list showed `KPI_ENIQS_CAT6_QRLY_CELL_NB_IOT_ERS_P`).
+
 ## D. Run on dev against the real tables
 
 ⏳ **Not run yet.** Needs the files uploaded to dev (the user does this) and the run process the user will give. Planned first
