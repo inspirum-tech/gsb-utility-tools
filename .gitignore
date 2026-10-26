@@ -1,0 +1,29 @@
+# Claude Code and OpenSpec (not pushed)
+.claude/
+CLAUDE.md
+openspec/
+
+# Secrets / local env files (the tool's config.env and tests/test.env hold no secrets and stay tracked)
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Local DuckDB / scratch data
+*.duckdb
+*.duckdb.wal
+*.db
+*.parquet
+
+# OS / editor
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+
+# Python / logs / temp
+__pycache__/
+*.pyc
+*.log
+*.tmp

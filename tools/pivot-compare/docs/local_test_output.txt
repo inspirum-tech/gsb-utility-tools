@@ -1,0 +1,45 @@
+# command: DUCKDB=duckdb tests/run_local_tests.sh   (DuckDB CLI v1.5.4, Windows, 2026-10-26)
+A. all known differences (strict verdict)
+  ok    exit code (1 = DIFFERENT) = 1
+  ok    verdict line starts with = DIFFERENT
+  ok    objects only in old = 1
+  ok    objects only in new = 1
+  ok    objects in both = 3
+  ok    KPI columns in both = 3
+  ok    KPI columns only in old = 1
+  ok    KPI columns only in new = 1
+  ok    values compared = 9
+  ok    values equal (rounding and NaN rule included) = 7
+  ok    values different = 1
+  ok    NULL in old only = 1
+  ok    NULL in new only = 0
+  ok    rows in differences.csv = 2
+  ok    rows in objects_one_side.csv = 2
+  ok    rows in kpi_columns_one_side.csv = 2
+  ok    the wrong value is K_1 of object 1|2 (50 against 51) = K_1,1|2,50.0,51.0,DIFF
+  ok    the NULL against a value is K_2 of object 2|1 = K_2,2|1,7.0,NULL_OLD_ONLY
+  ok    largest difference of K_1 = 1.0
+B. only the KPI that differs by rounding and NaN; objects and columns on one side tolerated -> IDENTICAL
+  ok    exit code (0 = IDENTICAL) = 0
+  ok    verdict line starts with = IDENTICAL
+  ok    values compared = 3
+C. a period with no data -> NOT COMPARABLE, never IDENTICAL
+  ok    exit code (3 = NOT COMPARABLE) = 3
+  ok    verdict line starts with = NOT COMPARABLE
+D. a KPI mapping file makes K_8 (new) the same KPI as K_9 (old)
+  ok    KPI columns in both = 4
+  ok    KPI columns only in old = 0
+  ok    values different = 1
+E. a tighter tolerance (1e-9) turns the rounding difference of 5e-9 into a difference
+  ok    values different = 2
+F. NULL read as the default value (-1) -> the NULL becomes a difference against 7
+  ok    values different = 2
+  ok    NULL in old only = 0
+G. NaN rule switched off -> NaN against -1 is a difference
+  ok    values different = 2
+H. a table name with something other than letters, digits and _ is refused
+  ok    exit code (2 = bad setup) = 2
+  ok    the message says why = 1
+
+passed: 33   failed: 0
+# exit code: 0

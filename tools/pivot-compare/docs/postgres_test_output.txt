@@ -1,0 +1,47 @@
+# command: DUCKDB=duckdb tests/run_postgres_test.sh   (DuckDB CLI v1.5.4, throwaway postgres:16-alpine in Docker, 2026-10-26)
+pivot-compare: KPI_TEST_QRLY_CELL_LTE_ERS_P (wide, postgres) against KPI_CALCULATED (tall, postgres)
+period (UTC): 2025-12-19 09:00:00+00  to  2025-12-19 09:15:00+00     report folder: tests/work_pg/report
+┌────────────────────────┬──────────┬──────────┬─────────┬──────────┬──────────┐
+│          what          │ old_side │ new_side │ in_both │ only_old │ only_new │
+│        varchar         │  int64   │  int64   │  int64  │  int64   │  int64   │
+├────────────────────────┼──────────┼──────────┼─────────┼──────────┼──────────┤
+│ objects (period + key) │        5 │        4 │       3 │        2 │        1 │
+└────────────────────────┴──────────┴──────────┴─────────┴──────────┴──────────┘
+┌─────────────┬──────────┬──────────┐
+│    what     │ old_side │ new_side │
+│   varchar   │  int128  │  int128  │
+├─────────────┼──────────┼──────────┤
+│ source rows │        5 │       20 │
+└─────────────┴──────────┴──────────┘
+┌─────────────┬──────────┬──────────┬─────────┬──────────┬──────────┐
+│    what     │ old_side │ new_side │ in_both │ only_old │ only_new │
+│   varchar   │  int64   │  int64   │  int64  │  int64   │  int64   │
+├─────────────┼──────────┼──────────┼─────────┼──────────┼──────────┤
+│ KPI columns │        5 │        5 │       4 │        1 │        1 │
+└─────────────┴──────────┴──────────┴─────────┴──────────┴──────────┘
+┌─────────┬──────────┬────────┬───────────┬───────────────┬───────────────┬───────────────────┐
+│  what   │ compared │ equal  │ different │ null_old_only │ null_new_only │ duplicate_entries │
+│ varchar │  int128  │ int128 │  int128   │    int128     │    int128     │       int64       │
+├─────────┼──────────┼────────┼───────────┼───────────────┼───────────────┼───────────────────┤
+│ values  │       12 │     10 │         1 │             1 │             0 │                 0 │
+└─────────┴──────────┴────────┴───────────┴───────────────┴───────────────┴───────────────────┘
+┌─────────┬──────────┬───────┬───────────┬───────────────┬───────────────┬──────────────┐
+│   kpi   │ compared │ equal │ different │ null_old_only │ null_new_only │ max_abs_diff │
+│ varchar │  int64   │ int64 │   int64   │     int64     │     int64     │    double    │
+├─────────┼──────────┼───────┼───────────┼───────────────┼───────────────┼──────────────┤
+│ K_1     │        3 │     2 │         1 │             0 │             0 │          1.0 │
+│ K_2     │        3 │     2 │         0 │             1 │             0 │          0.0 │
+└─────────┴──────────┴───────┴───────────┴───────────────┴───────────────┴──────────────┘
+DIFFERENT: objects only old=2 only new=1, KPI columns only old=1 only new=1, values compared=12 different=1 null_old_only=1 null_new_only=0, common objects=3, common KPI columns=4
+exit code: 1 (1 = DIFFERENT is expected: the fake data has known differences)
+differences.csv:
+period_utc,object_key,kpi,old_value,new_value,abs_diff,kind
+2025-12-19 09:00,1|2,K_1,50.0,51.0,1.0,DIFF
+2025-12-19 09:00,2|1,K_2,,7.0,,NULL_OLD_ONLY
+objects_one_side.csv:
+only_on_side,period_utc,object_key,source_rows
+new,2025-12-19 09:00,4|1,5
+old,2025-12-19 09:00,3|1,1
+old,2025-12-19 09:00,<NULL>|<NULL>,1
+duplicate_keys.csv:
+side,period_utc,object_key,kpi,source_rows

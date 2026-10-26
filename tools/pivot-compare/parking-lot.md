@@ -1,0 +1,17 @@
+# Parking lot: pivot-compare
+
+One file for everything to check later or to ask someone. Rows are never deleted. Kinds: ASK, CHECK, USER-OK.
+Statuses: OPEN, ASKED, ANSWERED, DONE, DROPPED.
+
+| ID | Date | Kind | Item | Who | Needed by | Fallback if no answer | Status |
+|---|---|---|---|---|---|---|---|
+| PC-01 | 2026-10-26 | ASK | Which Java branch is the production one: `release/array-counter-plus-ers-nsn-cellsite` or `release/prod-hourly-plus-ers-nsn-cellsite` (same question as P-13 in the platform parking lot)? Decides which formulas the old data came from | the user | the real sign-off run | compare against what is in the old pivot table whatever branch made it | OPEN |
+| PC-02 | 2026-10-26 | CHECK | `ENIQS_CAT6_REAL_A` is no longer in `gsb_data_kpi_base."KPI_CALCULATED"` on dev (only `ENIQS_CAT6`, `SMALLCELL`, `VENDOR_PARITY_TEST`). Do we re-run the engine for it? That writes to a shared table | the user | a bigger test | use `ENIQS_CAT6` (period 2025-12-19 09:00 UTC) | OPEN |
+| PC-03 | 2026-10-26 | USER-OK | Re-running the engine for any period writes to the shared tall table. Needs the user's OK first | the user | a bigger test | none: we do not run it | OPEN |
+| PC-04 | 2026-10-26 | CHECK | Only 28 of the 64 `ENIQS_CAT6` cells and 439 of its 1248 KPI ids exist in the old table at 2025-12-19 20:00 (Sydney). Were both calculators fed the same counters and the same KPI definitions? If not, the comparison on those is not a proof | the user / Pramudi | sign-off | report what matches and what does not; do not call it a proof | OPEN |
+| PC-05 | 2026-10-26 | CHECK | Old table time zone is assumed to be Sydney local (matches: the new `ENIQS_CAT6` period 20:00 +11 shows up as 20:00 in the old table). Confirm with the first real run (cell counts of both sides should overlap at that period) | us | first dev run | `OLD_PERIOD_TZ` in the config | OPEN |
+| PC-06 | 2026-10-26 | CHECK | DuckDB reading the old Postgres `numeric` columns (466 unconstrained numeric columns, partitioned table): works on the Docker test (small); confirm on dev (types, speed, memory) | us | first dev run | cast on the Postgres side with `postgres_query`, or compare one period at a time | OPEN |
+| PC-07 | 2026-10-26 | CHECK | Old table has no primary key; on dev 2025-12-19 18:00 there are 71 (site, cell) pairs with more than one row, 73 rows with NULL site or cell. `duplicate_keys.csv` lists them; decide with the old calculator owner what the right key is (maybe `CELL_NAME` too) | the user | sign-off | values reduced with `max()`; listed, not hidden | OPEN |
+| PC-08 | 2026-10-26 | CHECK | The new pivot tables built by `pivot-kpi` are keyed on (period, `EXT_CELL_NAME`) and carry `SITE_ID`/`CELL_ID` as plain columns; the tool compares the tall table directly with key `SITE_ID,CELL_ID`. For `NEW_SHAPE=wide` the key columns must be chosen to match | us | when a new pivot table exists | n/a | OPEN |
+| PC-09 | 2026-10-26 | CHECK | ENIQS/MOCN profiles are per cell and neighbour (`TGT_NODE`, `TGT_CELL`): the tall table can hold several rows per (cell, KPI) and the old pivot may too. If so add `TGT_NODE,TGT_CELL` to `NEW_KEY_COLS` and the matching old columns to `OLD_KEY_COLS` | us | first dev run | `duplicate_keys.csv` shows it | OPEN |
+| PC-10 | 2026-10-26 | CHECK | Server run process: the user will give it later. Until then the tool is run by hand from its folder | the user | deployment | by hand | OPEN |
