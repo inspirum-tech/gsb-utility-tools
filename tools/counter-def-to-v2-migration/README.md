@@ -145,7 +145,7 @@ The run is good when it ends with `RESULT: DRY RUN OK` and every check shows `PA
 ./migrate.sh $ENV
 ```
 
-It's done when the output ends with `RESULT: SUCCESS`. Keep the `reports/<time>_<env>/` folder.
+It's done when the output ends with `RESULT: SUCCESS`. Keep the `reports/<time>_<env>/` folder (see "View a run's results").
 
 ### 5. Quick check afterwards
 
@@ -167,6 +167,24 @@ grep DROP_EXISTING env/$ENV.conf          # must print ...="false"
 ```
 
 Then start the parser again. From now on, a rerun stops with `COUNTER_DEF_V2 already has rows` and changes nothing.
+
+### View a run's results
+
+Every run (dry or live) writes its own folder under `reports/`, named `<time>_<env>` (`_dry-run` added for a dry run).
+Run these from the tool folder:
+
+```bash
+ls -td reports/*/ | head -5                               # newest runs first
+R=$(ls -td reports/*/ | head -1)                          # the latest run (or set R=reports/<time>_<env>)
+sed -n '/^Checks/,/rows)$/p' "$R/migrate.log"             # every check with PASS / FAIL / INFO
+grep -c ',FAIL$' "$R/checks.csv"                          # must print 0
+column -s, -t < "$R/skipped_duplicates.csv" | less -S     # rows not migrated, and the row kept for each
+wc -l < "$R/name_changes.csv"                             # rows whose name or attributes changed (+1 header)
+grep -i 'error' "$R/migrate.log"                          # empty when the run passed
+```
+
+`checks.csv`, `skipped_duplicates.csv` and `name_changes.csv` open in Excel too: copy the folder off the server
+(e.g. `scp -r <user>@<server>:~/counter-def-to-v2-migration/reports/<time>_<env> .`).
 
 ### If it says `RESULT: FAILED`
 
