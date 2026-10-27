@@ -1,0 +1,52 @@
+DROP_EXISTING_COUNTER_DEF_V2=true: dropping COUNTER_DEF_V2 (if it exists) and recreating it.
+
+Checks (also in checks.csv):
+                                  check                                   | count | status 
+--------------------------------------------------------------------------+-------+--------
+ source rows, all vendors                                                 | 94505 | INFO
+ source rows selected (VENDORS)                                           | 94505 | INFO
+ names with Java prefix removed                                           | 48266 | INFO
+ names kept as-is (no Java prefix found, MEASUREMENT_PREFIX_VENDORS only) |    99 | INFO
+ array bins (ATTRIBUTES.array_bin, SUB_COUNTER=Y)                         | 31462 | INFO
+ duplicate identities skipped (skipped_duplicates.csv)                    |   110 | INFO
+ rows inserted                                                            | 94395 | INFO
+ bins whose parent row is not in the destination                          |     0 | INFO
+ NULL FIRST_SEEN_DATE filled with run time                                | 30106 | INFO
+ TIME_RESOLUTION H -> HRLY                                                | 28840 | INFO
+ TIME_RESOLUTION Q -> QRLY                                                | 65555 | INFO
+ row count: selected source rows = prepared rows                          |     0 | PASS
+ COUNTER_ID repeated in selected source rows                              |     0 | PASS
+ row count: inserted = prepared - skipped                                 |     0 | PASS
+ kept COUNTER_ID missing from destination                                 |     0 | PASS
+ destination COUNTER_ID not from source                                   |     0 | PASS
+ array bin matches more than one parent (ambiguous)                       |     0 | PASS
+ COUNTER_NAME / ATTRIBUTES / SUB_COUNTER differ from derived values       |     0 | PASS
+ COUNTER_NAME does not rebuild the source name (Java form)                |     0 | PASS
+ ATTRIBUTES is not a JSON object                                          |     0 | PASS
+ array_bin is not a whole number >= 0                                     |     0 | PASS
+ bin rule: SUB_COUNTER=Y exactly when array_bin is set                    |     0 | PASS
+ TIME_RESOLUTION differs from TIME_RESOLUTION_MAP                         |     0 | PASS
+ identity index UX_COUNTER_DEF_V2_IDENTITY missing on COUNTER_DEF_V2      |     0 | PASS
+ value changed: COUNTER_ID                                                |     0 | PASS
+ value changed: VERSION                                                   |     0 | PASS
+ value changed: VENDOR                                                    |     0 | PASS
+ value changed: MEASUREMENT_ID                                            |     0 | PASS
+ value changed: FRIENDLY_NAME                                             |     0 | PASS
+ value changed: VALUE_TYPE                                                |     0 | PASS
+ value changed: TECHNOLOGY                                                |     0 | PASS
+ value changed: OBJ_LEVEL                                                 |     0 | PASS
+ value changed: ENABLED                                                   |     0 | PASS
+ value changed: AGG_OP                                                    |     0 | PASS
+ value changed: DESC_COUNTER_NAME                                         |     0 | PASS
+ value changed: MOCN_NAME                                                 |     0 | PASS
+ value changed: APPLICATION                                               |     0 | PASS
+ value changed: FIRST_SEEN_DATE                                           |     0 | PASS
+ value changed: LAST_UPDATED_DATE                                         |     0 | PASS
+ value changed: LAST_UPDATED_BY                                           |     0 | PASS
+ source table changed: COUNTER_DEF                                        |     0 | PASS
+ source table changed: ERS_COUNTER_DEF                                    |     0 | PASS
+ source table changed: MEASUREMENT_DEF                                    |     0 | PASS
+(43 rows)
+
+COUNTER_ID sequence set to 50073584
+Committed.
