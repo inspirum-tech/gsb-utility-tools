@@ -94,6 +94,14 @@ P. a bad INFO_COLS name is refused
 Q. a tall NEW side has no info columns: the info check is NOT COMPARABLE, the KPI result is as in A
   ok    exit code (1 = KPI DIFFERENT, as in A) = 1
   ok    info verdict starts with = NOT COMPARABLE
+R. LIST mode: one config, a file with the table pairs, one report folder per pair
+  ok    exit code (2 = one pair could not run) = 2
+  ok    first pair: KPI result as in A = DIFFERENT
+  ok    first pair: values different as in A = 1
+  ok    second pair has its own report folder = 1
+  ok    rows in pairs_summary.csv (3 pairs) = 3
+  ok    the broken pair is an ERROR = ERROR
+  ok    info columns only for the pair that asks for them = 1,0
 
-passed: 79   failed: 0
+passed: 86   failed: 0
 # exit code: 0

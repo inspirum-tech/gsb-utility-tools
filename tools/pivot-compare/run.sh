@@ -35,7 +35,7 @@ opt_path()    { [ -z "${!1:-}" ] || need_path "$1"; }
 need_regex()  { case "${!1:-}" in ''|*\'*|*\"*|*\;*|*--*|*$'\n'*) die "$1 must be a regular expression without quotes, ; or --";; esac; }
 
 MODE="${MODE:-manual}"
-case "$MODE" in manual|auto) ;; *) die "MODE must be manual or auto";; esac
+case "$MODE" in manual|auto|list) ;; *) die "MODE must be manual, auto or list";; esac
 need_ts PERIOD_FROM; need_ts PERIOD_TO
 for v in TOLERANCE_ABS TOLERANCE_REL FLOAT_SLACK; do need_number "$v"; done
 need_signed SPECIAL_DEFAULT
@@ -52,15 +52,18 @@ command -v "$DUCKDB" >/dev/null 2>&1 || [ -x "$DUCKDB" ] || die "DuckDB CLI not 
 # info columns (labels such as SITE_NAME, CELL_NAME): compared and reported separately, never part of the KPI verdict
 INFO_COMPARE="${INFO_COMPARE:-no}"; INFO_COLS="${INFO_COLS:-}"; INFO_SELECT=""; INFO_ON=""
 need_yesno INFO_COMPARE
-if [ "$INFO_COMPARE" = yes ]; then
+build_info() {  # builds the SQL pieces of INFO_COLS (called at start and again for every line of a pairs file)
+  INFO_SELECT=""; INFO_ON=""
+  [ "$INFO_COMPARE" = yes ] || return 0
   [[ "$INFO_COLS" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || die "INFO_COLS must be column names separated by commas"
-  IFS_SAVE="$IFS"; IFS=','
-  for col in $INFO_COLS; do
-    INFO_SELECT+="${INFO_SELECT:+, }coalesce(CAST(\"$col\" AS VARCHAR), '~~NULL~~') AS \"$col\""
-    INFO_ON+="${INFO_ON:+, }\"$col\""
+  local IFS_SAVE="$IFS" c; IFS=','
+  for c in $INFO_COLS; do
+    INFO_SELECT+="${INFO_SELECT:+, }coalesce(CAST(\"$c\" AS VARCHAR), '~~NULL~~') AS \"$c\""
+    INFO_ON+="${INFO_ON:+, }\"$c\""
   done
   IFS="$IFS_SAVE"
-fi
+}
+build_info
 
 if [ "$MODE" = auto ]; then
   [[ "${AUTO_APPLICATIONS:-}" =~ ^(ALL|[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*)$ ]] || die "AUTO_APPLICATIONS must be ALL or application names separated by commas (letters, digits, _)"
@@ -333,6 +336,48 @@ if [ "$MODE" = manual ]; then
     rc="$(combine_rc "$rc" "$cmrc")"
   fi
   exit "$rc"
+fi
+
+# ---- list mode: the table pairs come from PAIRS_FILE (one comparison per line, one report folder per line) ----
+# PAIRS_FILE is a CSV with the header  name,old_table,new_table,key_cols,info_cols  ; lists inside a field use ; (SITE_ID;CELL_ID).
+# Everything else (sources, schemas, period, tolerance ...) comes from this config and is the same for every line.
+if [ "$MODE" = list ]; then
+  PAIRS_FILE="${PAIRS_FILE:-}"; need_path PAIRS_FILE; [ -f "$PAIRS_FILE" ] || die "PAIRS_FILE not found: $PAIRS_FILE"
+  BASE="$REPORT_DIR"; mkdir -p "$BASE"
+  echo "pivot-compare (list): $(($(wc -l < "$PAIRS_FILE") - 1)) table pairs from $PAIRS_FILE"
+  echo "period (UTC): $PERIOD_FROM  to  $PERIOD_TO     report folder: $BASE"
+  SUMMARY="$BASE/pairs_summary.csv"; echo "name,result,detail" > "$SUMMARY"
+  N_RUN=0; N_DIFF=0; N_NC=0; N_ERR=0; N_IDENT=0
+  while IFS=',' read -r name oldtbl newtbl keys infocols <&3; do
+    name="${name//[$'\r\n ']/}"; [ -n "$name" ] || continue
+    oldtbl="${oldtbl//[$'\r\n ']/}"; newtbl="${newtbl//[$'\r\n ']/}"; keys="${keys//[$'\r\n ']/}"; infocols="${infocols//[$'\r\n ']/}"
+    [[ "$name" =~ ^[A-Za-z0-9_]+$ ]] || die "pairs file: name '$name' must be letters, digits and _ only"
+    N_RUN=$((N_RUN+1))
+    set +e
+    ( set -e
+      FAMILY_TABLE=""; OLD_TABLE="$oldtbl"; NEW_TABLE="$newtbl"; REPORT_DIR="$BASE/$name"
+      OLD_KEY_COLS="${keys//;/,}"; NEW_KEY_COLS="${keys//;/,}"
+      if [ -n "$infocols" ]; then INFO_COLS="${infocols//;/,}"; INFO_COMPARE=yes; fi
+      build_info
+      run_one > "$BASE/$name.screen.txt" 2>&1 ) < /dev/null
+    rc=$?
+    set -e
+    detail="$( [ -s "$BASE/$name/verdict.txt" ] && cat "$BASE/$name/verdict.txt" || echo "no verdict (see $BASE/$name.screen.txt)" )"
+    case "$rc" in
+      0) res=IDENTICAL; N_IDENT=$((N_IDENT+1)) ;; 1) res=DIFFERENT; N_DIFF=$((N_DIFF+1)) ;; 3) res="NOT COMPARABLE"; N_NC=$((N_NC+1)) ;;
+      *) res=ERROR; N_ERR=$((N_ERR+1)) ;;
+    esac
+    printf '%s,%s,"%s"\n' "$name" "$res" "${detail//\"/\'}" >> "$SUMMARY"
+    printf '  %-16s %s\n' "$name" "$res"
+    printf '      %s\n' "$detail" | cut -c1-260
+  done 3< <(tail -n +2 "$PAIRS_FILE")   # the first line is the header
+  echo
+  echo "pairs: $N_RUN   identical: $N_IDENT   different: $N_DIFF   not comparable: $N_NC   errors: $N_ERR"
+  echo "summary: $SUMMARY     details per pair: $BASE/<name>/"
+  if [ "$N_ERR" -gt 0 ]; then exit 2
+  elif [ "$N_DIFF" -gt 0 ]; then exit 1
+  elif [ "$N_RUN" -eq 0 ] || [ "$N_NC" -gt 0 ]; then exit 3
+  else exit 0; fi
 fi
 
 # ---- auto mode: find the families from the KPI definitions, compare each one ----------------------------

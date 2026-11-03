@@ -186,6 +186,22 @@ code=$(run Q); R=$W/report_Q
 check "exit code (1 = KPI DIFFERENT, as in A)" 1 "$code"
 check "info verdict starts with" "NOT COMPARABLE" "$(cut -d: -f1 "$R/info_verdict.txt")"
 
+echo "R. LIST mode: one config, a file with the table pairs, one report folder per pair"
+printf 'name,old_table,new_table,key_cols,info_cols
+first,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,CELL_NAME
+second,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,
+broken,old_pivot;drop,KPI_CALCULATED,SITE_ID;CELL_ID,
+' > "$W/pairs.csv"
+variant R MODE=list "PAIRS_FILE=$W/pairs.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes
+code=$(run R); R=$W/report_R
+check "exit code (2 = one pair could not run)" 2 "$code"
+check "first pair: KPI result as in A" DIFFERENT "$(cut -d: -f1 "$R/first/verdict.txt")"
+check "first pair: values different as in A" 1 "$(metric $R/first values_different)"
+check "second pair has its own report folder" 1 "$([ -f "$R/second/verdict.txt" ] && echo 1 || echo 0)"
+check "rows in pairs_summary.csv (3 pairs)" 3 "$(rows $R/pairs_summary.csv)"
+check "the broken pair is an ERROR" ERROR "$("$DUCKDB" -csv -noheader -c "SELECT result FROM read_csv('$R/pairs_summary.csv') WHERE name = 'broken'")"
+check "info columns only for the pair that asks for them" "1,0" "$([ -f "$R/first/info_verdict.txt" ] && echo -n 1 || echo -n 0),$([ -f "$R/second/info_verdict.txt" ] && echo 1 || echo 0)"
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]
