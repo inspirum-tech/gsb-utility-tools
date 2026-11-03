@@ -132,3 +132,19 @@ DIFFERENT: objects only old=68333 only new=889, KPI columns only old=7 only new=
 Source rows old 723,434 for 353,041 objects; 55,296 duplicate entries. First differences: all `K_-11` in the first period, old larger than new; cell `81717|67`
 new value 113507 equals the OLD value of `81717|66` (hint of repeated old rows; not proven). Reasons for the differences, the empties and the one-side cells: ⏳ not yet analysed.
 PC-05 (Sydney time) supported by 284,708 common objects; PC-06 (reading 51 numeric columns, speed) ✅.
+
+## H. `scripts/load_old_table.sh` (loads the UAT old-calculator CSV files into one old pivot table)
+
+Tested 2026-11-03 against a throwaway `postgres:16` container (removed afterwards; nothing on dev) with the real `CELL_NBIOT` files (4 files, 148,006 rows)
+and a partitioned test table that held 2 old rows in an old partition. Verbatim result lines:
+
+```
+state after run 1: table=148006 backup=2 partitions=T_P_p20250101 T_P_p20261025
+2. 148006 existing rows backed up to T_P_BKP_20261103 and deleted from T_P
+5. rows in table: 148006   rows in files: 148006   periods: 13
+RESULT: OK
+load_old_table: backup table T_P_BKP_20261103 already exists; look at it first        (same-day backup exists: stops, deletes nothing)
+load_old_table: CSV columns that are not in the table: K_-223                           (table column dropped: refused, 148006 rows unchanged)
+```
+
+Mistake found while testing: `zcat | head -1` under `set -o pipefail` ended the script with exit 141 (broken pipe); fixed with `|| true` and a check that the header is not empty. ✅
