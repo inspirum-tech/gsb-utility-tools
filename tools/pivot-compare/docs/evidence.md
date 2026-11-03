@@ -78,3 +78,30 @@ is really called `..._NB_IOT_ERS_P`; on dev the schema list showed `KPI_ENIQS_CA
 
 ⏳ **Not run yet.** Needs the files uploaded to dev (the user does this) and the run process the user will give. Planned first
 run: the default `config.env` (ENIQS_CAT6 LTE, 2025-12-19 09:00 UTC = 20:00 Sydney). Before it is trusted: PC-04, PC-05, PC-06.
+
+## E. CM comparison (new, branch `feature/pivot-compare-cm`)
+
+Environment: Windows 11, DuckDB CLI v1.5.4, fake CM tables `tests/make_fake_cm_old.sql` / `make_fake_cm_new.sql` (known differences: one wrong
+value BW of B 10 against 15, one NULL against a value FREQ of C, one object only in each side, one column only in each side, a
+1e-9 rounding inside the tolerance, a later CM row after the period that must be ignored).
+
+Command: `DUCKDB=duckdb tests/run_local_tests.sh` - verbatim last lines (full output in `docs/local_test_output.txt`):
+
+```
+passed: 65   failed: 0
+# exit code: 0
+```
+
+Sections J-M are the CM checks (19 of the 65): off by default writes no `cm/` folder; DIFFERENT with exactly the known differences;
+no history column gives objects with several rows; a bad `CM_KEY_COLS` is refused with exit code 2. ✅
+
+Facts found on dev (read only), 2026-11-03:
+
+| # | Claim | Verbatim result | Verdict |
+|---|---|---|---|
+| 14 | CM tables exist in Postgres | `gsb_data_cm`: `CM_ERS_5G_CALC, CM_ERS_LTE_CALC, CM_HW_LTE_CALC, CM_NSN_5G_CALC, CM_NSN_LTE_CALC, CM_PEMS_LTE_CALC`; copies in `gsb_data_cm_backup`; `pems_data_cm.CM_PEMS_LTE_CALC` | ✅ |
+| 15 | CM tables keep history | `row_count 92835, cells 90370, loads 403, first_load 2023-06-23 17:39:40, last_load 2026-10-28 05:00:46` | ✅ |
+| 16 | Old NS pivot periods | most tables `2025-10-10 00:00 - 23:45`; LTE `2026-04-23 04:30`; 6 tables empty (`CELL_MIXED, NODE_EPNGU, NODE_PIST, NODE_RPUPL, NODE_S1ULINK, NODE_SCTP`) | ✅ |
+| 17 | New NS pivot (DuckLake `gsb_data_kpi_pivot_dev`) | LTE cell: `2026-10-24 21:15+11 - 2026-10-25 01:00+11, 16 periods, 499020 rows`; 23 tables named `..._ERS_NEW_P` | ✅ (LTE only checked) |
+
+⏳ Not run against the real dev CM tables yet. The two sides to compare are not decided (parking lot PC-13).

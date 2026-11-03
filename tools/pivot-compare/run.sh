@@ -238,10 +238,80 @@ UPDATE new_cols SET kpi = m.old_kpi FROM kpimap m WHERE new_cols.kpi = m.new_kpi
   esac
 }
 
+# ---- CM comparison (CM_COMPARE=yes): the CM table of the old side against the CM table of the new side -------
+CM_COMPARE="${CM_COMPARE:-no}"
+CM_FAIL_ON_OBJECTS_ONE_SIDE="${CM_FAIL_ON_OBJECTS_ONE_SIDE:-yes}"
+CM_FAIL_ON_COLUMNS_ONE_SIDE="${CM_FAIL_ON_COLUMNS_ONE_SIDE:-no}"
+need_yesno CM_COMPARE
+
+run_cm() {  # $1 = folder for the CM report files; returns 0 IDENTICAL, 1 DIFFERENT, 3 NOT COMPARABLE, 2 error
+  local CM_REPORT_DIR="$1" P col IFS_OLD="$IFS" skip excl=""
+  need_yesno CM_FAIL_ON_OBJECTS_ONE_SIDE; need_yesno CM_FAIL_ON_COLUMNS_ONE_SIDE
+  [[ "${CM_KEY_COLS:-}" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || die "CM_KEY_COLS must be names separated by commas"
+  [ -z "${CM_EXCLUDE_COLS:-}" ] || [[ "$CM_EXCLUDE_COLS" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || die "CM_EXCLUDE_COLS must be names separated by commas"
+  opt_ident CM_ASOF_COL
+  [ -z "${CM_ASOF_COL:-}" ] || [[ "${CM_ASOF_TZ:-}" =~ ^[A-Za-z0-9_/+-]+$ ]] || die "CM_ASOF_TZ must be a time zone name"
+
+  CM_K_EXPR=""; IFS=','
+  for col in $CM_KEY_COLS; do
+    [ -z "$CM_K_EXPR" ] || CM_K_EXPR+=" || '|' || "
+    CM_K_EXPR+="coalesce(CAST(\"$col\" AS VARCHAR), '<NULL>')"
+  done
+  # columns that are never compared: internal helper columns, key columns, the as-of column, CM_EXCLUDE_COLS (each once)
+  for col in __k __a __n $CM_KEY_COLS ${CM_ASOF_COL:-} ${CM_EXCLUDE_COLS:-}; do
+    case ",$excl," in *",\"$col\","*) continue;; esac
+    excl+="${excl:+,}\"$col\""
+  done
+  IFS="$IFS_OLD"
+  CM_EXCLUDE_SQL="$excl"
+
+  ATTACH_SQL=""; ATTACHED_KEYS=""
+  local ref schema table sv tv
+  for P in CM_OLD CM_NEW; do
+    sv="${P}_SCHEMA"; tv="${P}_TABLE"; schema="${!sv:-main}"; table="${!tv:-}"
+    for col in "$schema" "$table"; do [[ "$col" =~ ^[A-Za-z0-9_]+$ ]] || die "${P}: schema and table must be letters, digits, _ only"; done
+    attach_source "$P"; ref="${ALIAS}.\"${schema}\".\"${table}\""
+    if [ -n "${CM_ASOF_COL:-}" ]; then
+      printf -v "${P}_A_EXPR" '%s' "\"${CM_ASOF_COL}\""
+      printf -v "${P}_WHERE" '%s' "WHERE \"${CM_ASOF_COL}\" <= (TIMESTAMPTZ '${PERIOD_TO}' AT TIME ZONE '${CM_ASOF_TZ}')"
+    else
+      printf -v "${P}_A_EXPR" '%s' "NULL"; printf -v "${P}_WHERE" '%s' ""
+    fi
+    printf -v "${P}_REF" '%s' "$ref"; printf -v "${P}_K_EXPR" '%s' "$CM_K_EXPR"
+  done
+
+  local SQL_BODY; SQL_BODY="$(render sql/40_cm.sql)"
+  mkdir -p "$CM_REPORT_DIR"
+  printf '%s' "$SQL_BODY" > "$CM_REPORT_DIR/generated_cm.sql"   # no connection strings in it
+  local T; T="$(mktemp -d)"; chmod 700 "$T"
+  printf '%s\n%s\n%s' "$ATTACH_SQL" "$(duck_settings)" "$SQL_BODY" > "$T/run.sql"
+  rm -f "$CM_REPORT_DIR/cm_verdict.txt"
+  local rc=0
+  "$DUCKDB" -bail -f "$T/run.sql" || rc=$?
+  rm -rf "$T"
+  [ "$rc" -eq 0 ] || { echo "the CM comparison stopped with an error; nothing was written to the sources" >&2; return 2; }
+  [ -s "$CM_REPORT_DIR/cm_verdict.txt" ] || die "no CM verdict was written"
+  case "$(cut -d: -f1 "$CM_REPORT_DIR/cm_verdict.txt")" in
+    IDENTICAL) return 0 ;; DIFFERENT) return 1 ;; "NOT COMPARABLE") return 3 ;; *) return 2 ;;
+  esac
+}
+
+combine_rc() {  # $1 = KPI result code, $2 = CM result code -> overall exit code (a CM difference makes the run DIFFERENT)
+  if [ "$1" -eq 2 ] || [ "$2" -eq 2 ]; then echo 2
+  elif [ "$1" -eq 1 ] || [ "$2" -eq 1 ]; then echo 1
+  elif [ "$1" -eq 3 ] || [ "$2" -eq 3 ]; then echo 3
+  else echo 0; fi
+}
+
 # ---- manual mode ------------------------------------------------------------------------------------
 if [ "$MODE" = manual ]; then
   FAMILY_TABLE=""
   rc=0; run_one || rc=$?
+  if [ "$CM_COMPARE" = yes ]; then
+    echo; echo "pivot-compare: CM comparison ${CM_OLD_SCHEMA}.${CM_OLD_TABLE} against ${CM_NEW_SCHEMA}.${CM_NEW_TABLE}"
+    cmrc=0; run_cm "$REPORT_DIR/cm" || cmrc=$?
+    rc="$(combine_rc "$rc" "$cmrc")"
+  fi
   exit "$rc"
 fi
 
@@ -297,7 +367,13 @@ done 3< "$BASE/families.txt"
 echo
 echo "families found: $N_FAM   compared: $N_RUN   skipped (no old table): $N_SKIP   different: $N_DIFF   not comparable: $N_NC   errors: $N_ERR"
 echo "summary: $SUMMARY     details per family: $BASE/<family>/"
-if [ "$N_ERR" -gt 0 ]; then exit 2
-elif [ "$N_DIFF" -gt 0 ]; then exit 1
-elif [ "$N_RUN" -eq 0 ] || [ "$N_NC" -gt 0 ]; then exit 3
-else exit 0; fi
+if [ "$N_ERR" -gt 0 ]; then rc=2
+elif [ "$N_DIFF" -gt 0 ]; then rc=1
+elif [ "$N_RUN" -eq 0 ] || [ "$N_NC" -gt 0 ]; then rc=3
+else rc=0; fi
+if [ "$CM_COMPARE" = yes ]; then
+  echo; echo "pivot-compare: CM comparison ${CM_OLD_SCHEMA}.${CM_OLD_TABLE} against ${CM_NEW_SCHEMA}.${CM_NEW_TABLE}"
+  cmrc=0; run_cm "$BASE/cm" || cmrc=$?
+  rc="$(combine_rc "$rc" "$cmrc")"
+fi
+exit "$rc"

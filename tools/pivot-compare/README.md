@@ -115,6 +115,29 @@ found *and* there is something in common. Nothing in common is `NOT COMPARABLE`,
 * A NULL on one side and a value on the other is reported, not hidden (`NULL_AS_DEFAULT=no`). A KPI that is NULL on
   both sides counts as equal.
 
+## CM comparison (optional, `CM_COMPARE=yes`)
+
+A KPI mismatch is often caused by the CM data (configuration management: cell parameters, bandwidth, frequency ...) and not
+by the calculation. With `CM_COMPARE=yes` the run also compares one CM table of the old side with one CM table of the new side.
+With `CM_COMPARE=no` (the default) the CM step does not run at all and no `cm/` folder is written.
+
+```
+OLD CM_ERS_LTE_CALC                          NEW CM_ERS_LTE_CALC
+CELL_NAME  INSERT_DT    BW   FREQ            CELL_NAME  INSERT_DT    BW   FREQ
+A          2025-12-01   20   100             A          2025-12-01   20   100     -> equal
+B          2025-12-01   10   200             B          2025-12-01   15   200     -> BW differs
+```
+
+* An object is the `CM_KEY_COLS` joined with `|`. Every other column is compared (`CM_EXCLUDE_COLS` leaves some out), as text,
+  or as numbers with the KPI tolerance when both are numbers.
+* CM tables keep history (the dev `CM_ERS_LTE_CALC` has 403 loads since 2023). With `CM_ASOF_COL` set, the row **in force at
+  `PERIOD_TO`** is used per object (the latest row with `CM_ASOF_COL <= PERIOD_TO`), so a CM load after the period cannot
+  cause a difference. Objects that still have several rows are counted (`objects_with_several_rows`).
+* Files in `REPORT_DIR/cm/` (in auto mode also `REPORT_DIR/cm/`): `cm_verdict.txt`, `cm_summary.csv`, `cm_differences.csv`,
+  `cm_objects_one_side.csv`, `cm_columns_one_side.csv`, `cm_column_summary.csv`, `generated_cm.sql`.
+* A CM `DIFFERENT` makes the exit code 1 even when the KPI result is IDENTICAL. The CM tables are in `config.env`
+  (`CM_OLD_*`, `CM_NEW_*`); the sources work like the KPI sides.
+
 ## Likely reasons for a difference that is *not* a bug
 
 Do not "fix" a difference by changing either calculator: report it with the likely reason.

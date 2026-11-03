@@ -11,6 +11,8 @@ W=tests/work
 rm -rf "$W"; mkdir -p "$W"
 "$DUCKDB" "$W/old.duckdb" < tests/make_fake_data.sql >/dev/null || { echo "could not build the fake OLD data" >&2; exit 2; }
 "$DUCKDB" "$W/new.duckdb" < tests/make_fake_data_new.sql >/dev/null || { echo "could not build the fake NEW data" >&2; exit 2; }
+"$DUCKDB" "$W/cm_old.duckdb" < tests/make_fake_cm_old.sql >/dev/null || { echo "could not build the fake OLD CM data" >&2; exit 2; }
+"$DUCKDB" "$W/cm_new.duckdb" < tests/make_fake_cm_new.sql >/dev/null || { echo "could not build the fake NEW CM data" >&2; exit 2; }
 
 PASS=0; FAIL=0
 check() {  # name, expected, actual
@@ -18,6 +20,7 @@ check() {  # name, expected, actual
   else FAIL=$((FAIL+1)); echo "  FAIL  $1: expected '$2', got '$3'"; fi
 }
 metric() { "$DUCKDB" -csv -noheader -c "SELECT value FROM read_csv('$1/summary.csv') WHERE metric = '$2'"; }
+cmmetric() { "$DUCKDB" -csv -noheader -c "SELECT value FROM read_csv('$1/cm_summary.csv') WHERE metric = '$2'"; }
 rows()   { "$DUCKDB" -csv -noheader -c "SELECT count(*) FROM read_csv('$1')"; }
 # variant NAME 'KEY=value' ...  : the test config plus overrides (a later line wins when the file is read)
 variant() { local n="$1"; shift; { cat tests/test.env; for o in "$@"; do echo "$o"; done; echo "REPORT_DIR=$W/report_$n"; } > "$W/$n.env"; }
@@ -110,6 +113,43 @@ check "LTE: values different" 1 "$(metric $RL values_different)"
 check "LTE: NULL in old only" 1 "$(metric $RL values_null_old_only)"
 check "LTE: KPI columns only in new (other family's K_8 is not counted)" 0 "$(metric $RL only_new_kpi_columns)"
 check "5G: objects only in old and new" 0 "$(( $(metric $R/KPI_APP_TEST_QRLY_CELL_5G_ERS_P only_old_objects) + $(metric $R/KPI_APP_TEST_QRLY_CELL_5G_ERS_P only_new_objects) ))"
+
+echo "J. CM comparison switched off: no CM folder is written"
+check "no cm folder in the report of test A (CM_COMPARE is not set)" 0 "$([ -d "$W/report_A/cm" ] && echo 1 || echo 0)"
+
+echo "K. CM comparison switched on (history: the row in force at PERIOD_TO is used)"
+CMCFG=(CM_COMPARE=yes CM_OLD_SOURCE=duckdb CM_OLD_DSN_ENV= CM_OLD_DB_FILE=$W/cm_old.duckdb CM_OLD_SCHEMA=main CM_OLD_TABLE=CM_TEST
+  CM_NEW_SOURCE=duckdb CM_NEW_DSN_ENV= CM_NEW_DB_FILE=$W/cm_new.duckdb CM_NEW_SCHEMA=main CM_NEW_TABLE=CM_TEST
+  CM_KEY_COLS=CELL_NAME CM_ASOF_COL=INSERT_DT CM_ASOF_TZ=Australia/Sydney CM_EXCLUDE_COLS=)
+variant K "${CMCFG[@]}" 'PERIOD_FROM="2025-12-19 09:00:00+00"'
+code=$(run K); R=$W/report_K/cm
+check "exit code (1 = DIFFERENT)" 1 "$code"
+check "CM verdict starts with" DIFFERENT "$(cut -d: -f1 "$R/cm_verdict.txt")"
+check "CM objects in old" 4 "$(cmmetric $R old_objects)"
+check "CM objects in new" 4 "$(cmmetric $R new_objects)"
+check "CM objects in both" 3 "$(cmmetric $R common_objects)"
+check "CM objects only in old (D)" 1 "$(cmmetric $R only_old_objects)"
+check "CM objects only in new (E)" 1 "$(cmmetric $R only_new_objects)"
+check "CM columns in both (BW, STATE, FREQ; not the key or the as-of column)" 3 "$(cmmetric $R common_columns)"
+check "CM columns only in old" 1 "$(cmmetric $R only_old_columns)"
+check "CM columns only in new" 1 "$(cmmetric $R only_new_columns)"
+check "CM values compared" 9 "$(cmmetric $R values_compared)"
+check "CM values equal (A's 1e-9 and the later CM row ignored)" 7 "$(cmmetric $R values_equal)"
+check "CM values different" 1 "$(cmmetric $R values_different)"
+check "CM NULL in old only" 1 "$(cmmetric $R values_null_old_only)"
+check "CM objects with several rows after the as-of cut" 0 "$(cmmetric $R objects_with_several_rows)"
+check "the wrong value is BW of B (10 against 15)" "B,BW,10.0,15.0" \
+  "$("$DUCKDB" -csv -noheader -c "SELECT object_key, cm_column, old_value, new_value FROM read_csv('$R/cm_differences.csv') WHERE kind = 'DIFF'")"
+
+echo "L. CM comparison without a history column: both rows of A count as several rows"
+variant L "${CMCFG[@]}" CM_ASOF_COL=
+code=$(run L); R=$W/report_L/cm
+check "CM objects with several rows" 2 "$(cmmetric $R objects_with_several_rows)"
+
+echo "M. a bad CM key column name is refused"
+variant M "${CMCFG[@]}" 'CM_KEY_COLS="CELL_NAME;drop"'
+code=$(run M)
+check "exit code (2 = bad setup)" 2 "$code"
 
 echo
 echo "passed: $PASS   failed: $FAIL"
