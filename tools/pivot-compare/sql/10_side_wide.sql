@@ -26,4 +26,7 @@ FROM (
 )
 GROUP BY 1, 2, 3;
 
+-- ${SIDE}_info (p_utc, k, col, val): the info columns (INFO_COLS) as text; empty when INFO_COMPARE=no
+${INFO_SIDE_SQL}
+
 DROP TABLE ${SIDE}_src;

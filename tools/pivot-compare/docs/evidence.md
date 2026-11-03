@@ -105,3 +105,30 @@ Facts found on dev (read only), 2026-11-03:
 | 17 | New NS pivot (DuckLake `gsb_data_kpi_pivot_dev`) | LTE cell: `2026-10-24 21:15+11 - 2026-10-25 01:00+11, 16 periods, 499020 rows`; 23 tables named `..._ERS_NEW_P` | ✅ (LTE only checked) |
 
 ⏳ Not run against the real dev CM tables yet. The two sides to compare are not decided (parking lot PC-13).
+
+## F. Info columns check (new, branch `feature/pivot-compare-cm`)
+
+Command: `DUCKDB=duckdb tests/run_local_tests.sh` (DuckDB CLI v1.5.4, Windows 11, fake data `tests/make_fake_info.sql`). Last lines, verbatim:
+
+```
+passed: 79   failed: 0
+# exit code: 0
+```
+
+Sections N-Q (14 of the 79): `SITE_NAME, CELL_NAME, LAC, TAC` compared on 3 common objects (12 values: 10 equal incl. `57252.00` against `57252`, 1 CELL_NAME
+difference, 1 NULL in old only); the KPI verdict stays IDENTICAL and the exit code 0; `INFO_COMPARE=no` writes no info files; a bad `INFO_COLS`
+is refused (exit 2); a tall new side gives `NOT COMPARABLE`. ✅
+
+## G. First real dev run: NS LTE cell (2026-11-03)
+
+Old: Postgres `gsb_data_kpi_pivot."KPI_NS_QRLY_CELL_LTE_ERS_P"` (UAT output loaded 2026-11-03: 1,851,508 rows, 13 periods 2026-10-25 00:00-03:00; the 53,893
+April rows were backed up to `..._BKP_20261103` and deleted; daily partition `..._p20261025` added). New: DuckLake `gsb_data_kpi_pivot_dev."KPI_NS_QRLY_CELL_LTE_ERS_NEW_P"`.
+Command: `./run.sh config_ns_lte.env` (17 s, exit code 1). Verbatim last line:
+
+```
+DIFFERENT: objects only old=68333 only new=889, KPI columns only old=7 only new=0, values compared=12527152 different=545 null_old_only=376624 null_new_only=0, common objects=284708, common KPI columns=44
+```
+
+Source rows old 723,434 for 353,041 objects; 55,296 duplicate entries. First differences: all `K_-11` in the first period, old larger than new; cell `81717|67`
+new value 113507 equals the OLD value of `81717|66` (hint of repeated old rows; not proven). Reasons for the differences, the empties and the one-side cells: ⏳ not yet analysed.
+PC-05 (Sydney time) supported by 284,708 common objects; PC-06 (reading 51 numeric columns, speed) ✅.

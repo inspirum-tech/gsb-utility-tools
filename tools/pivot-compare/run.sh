@@ -49,6 +49,19 @@ opt_path KPI_LIST_FILE; opt_path KPI_MAP_FILE; need_path REPORT_DIR; opt_path TE
 [ -z "${KPI_MAP_FILE}" ] || [ -f "$KPI_MAP_FILE" ] || die "KPI_MAP_FILE not found: $KPI_MAP_FILE"
 command -v "$DUCKDB" >/dev/null 2>&1 || [ -x "$DUCKDB" ] || die "DuckDB CLI not found (DUCKDB=$DUCKDB)"
 
+# info columns (labels such as SITE_NAME, CELL_NAME): compared and reported separately, never part of the KPI verdict
+INFO_COMPARE="${INFO_COMPARE:-no}"; INFO_COLS="${INFO_COLS:-}"; INFO_SELECT=""; INFO_ON=""
+need_yesno INFO_COMPARE
+if [ "$INFO_COMPARE" = yes ]; then
+  [[ "$INFO_COLS" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || die "INFO_COLS must be column names separated by commas"
+  IFS_SAVE="$IFS"; IFS=','
+  for col in $INFO_COLS; do
+    INFO_SELECT+="${INFO_SELECT:+, }coalesce(CAST(\"$col\" AS VARCHAR), '~~NULL~~') AS \"$col\""
+    INFO_ON+="${INFO_ON:+, }\"$col\""
+  done
+  IFS="$IFS_SAVE"
+fi
+
 if [ "$MODE" = auto ]; then
   [[ "${AUTO_APPLICATIONS:-}" =~ ^(ALL|[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*)$ ]] || die "AUTO_APPLICATIONS must be ALL or application names separated by commas (letters, digits, _)"
   for v in DEF_SCHEMA DEF_TABLE DEF_COL_KPI_ID DEF_COL_APPLICATION DEF_COL_RESOLUTION DEF_COL_LEVEL DEF_COL_TECHNOLOGY DEF_COL_VENDOR; do need_ident "$v"; done
@@ -143,6 +156,12 @@ prep_side() {  # $1 = OLD or NEW
     FILTER_SQL=" AND \"$fc\" = '${fv//\'/\'\'}'"
   fi
 
+  if [ "$INFO_COMPARE" = yes ] && [ "$shape" = wide ]; then
+    INFO_SIDE_SQL="CREATE OR REPLACE TEMP TABLE ${side}_info AS SELECT p_utc, k, col, max(val) AS val FROM (SELECT __p AS p_utc, __k AS k, col, nullif(val, '~~NULL~~') AS val FROM (UNPIVOT (SELECT __p, __k, ${INFO_SELECT} FROM ${side}_src) ON ${INFO_ON} INTO NAME col VALUE val)) GROUP BY 1, 2, 3;"
+  else
+    INFO_SIDE_SQL="CREATE OR REPLACE TEMP TABLE ${side}_info AS SELECT CAST(NULL AS TIMESTAMPTZ) AS p_utc, CAST(NULL AS VARCHAR) AS k, CAST(NULL AS VARCHAR) AS col, CAST(NULL AS VARCHAR) AS val WHERE false;"
+  fi
+
   SIDE="$side"; REF="${alias}.\"$schema\".\"$table\""; K_EXPR="$kexpr"; PER_COL="\"$pcol\""
   SIDE_KPI_REGEX="$(v KPI_REGEX)"; SIDE_PREFIX=""; KPI_COL_Q=""; VALUE_COL_Q=""
   if [ "$shape" = wide ]; then
@@ -209,6 +228,7 @@ UPDATE new_cols SET kpi = m.old_kpi FROM kpimap m WHERE new_cols.kpi = m.new_kpi
   fi
   export KPI_MAP_SQL KPI_ALLOWED_SELECT DUP_THRESHOLD_OLD DUP_THRESHOLD_NEW
   SQL_BODY+="$(render sql/20_compare.sql)"$'\n'
+  [ "$INFO_COMPARE" != yes ] || SQL_BODY+="$(render sql/25_info.sql)"$'\n'
   SQL_BODY+="$(render sql/30_report.sql)"$'\n'
 
   mkdir -p "$REPORT_DIR"

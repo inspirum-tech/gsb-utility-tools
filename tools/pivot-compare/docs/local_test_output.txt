@@ -76,6 +76,24 @@ L. CM comparison without a history column: both rows of A count as several rows
   ok    CM objects with several rows = 2
 M. a bad CM key column name is refused
   ok    exit code (2 = bad setup) = 2
+N. info columns: compared and reported separately, the KPI verdict is not changed
+  ok    exit code stays 0 (KPI values are IDENTICAL although the info columns differ) = 0
+  ok    KPI verdict starts with = IDENTICAL
+  ok    info verdict starts with = DIFFERENT
+  ok    info objects compared (the object only in new is not one) = 3
+  ok    info values compared (3 objects x 4 columns) = 12
+  ok    info values equal (TAC 57252.00 against 57252 is equal) = 10
+  ok    info values different = 1
+  ok    info NULL in old only = 1
+  ok    the info difference is CELL_NAME of 1|2 = 1|2,CELL_NAME,c12,c12-X
+O. INFO_COMPARE=no (default): no info files are written
+  ok    no info_verdict.txt = 0
+  ok    exit code (0 = IDENTICAL) = 0
+P. a bad INFO_COLS name is refused
+  ok    exit code (2 = bad setup) = 2
+Q. a tall NEW side has no info columns: the info check is NOT COMPARABLE, the KPI result is as in A
+  ok    exit code (1 = KPI DIFFERENT, as in A) = 1
+  ok    info verdict starts with = NOT COMPARABLE
 
-passed: 65   failed: 0
+passed: 79   failed: 0
 # exit code: 0

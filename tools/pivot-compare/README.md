@@ -115,6 +115,14 @@ found *and* there is something in common. Nothing in common is `NOT COMPARABLE`,
 * A NULL on one side and a value on the other is reported, not hidden (`NULL_AS_DEFAULT=no`). A KPI that is NULL on
   both sides counts as equal.
 
+## Info columns (optional, `INFO_COMPARE=yes`)
+
+The KPI values are the calculator's output. Columns such as `SITE_NAME`, `CELL_NAME`, `LAC`, `SAC`, `TAC` are labels copied from
+CM or mapping data. With `INFO_COMPARE=yes` and `INFO_COLS=SITE_NAME,CELL_NAME,LAC,SAC,TAC` they are compared too, for the objects
+that exist on both sides (wide sides only; a tall side has no such columns and gives `NOT COMPARABLE`). The result is **reported
+separately** (`info_verdict.txt`, `info_summary.csv`, `info_column_summary.csv`, `info_differences.csv`) and **never changes the KPI
+verdict or the exit code**. Numbers are compared as numbers (`57252.00` equals `57252`), everything else as text.
+
 ## CM comparison (optional, `CM_COMPARE=yes`)
 
 A KPI mismatch is often caused by the CM data (configuration management: cell parameters, bandwidth, frequency ...) and not

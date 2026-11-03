@@ -11,6 +11,7 @@ W=tests/work
 rm -rf "$W"; mkdir -p "$W"
 "$DUCKDB" "$W/old.duckdb" < tests/make_fake_data.sql >/dev/null || { echo "could not build the fake OLD data" >&2; exit 2; }
 "$DUCKDB" "$W/new.duckdb" < tests/make_fake_data_new.sql >/dev/null || { echo "could not build the fake NEW data" >&2; exit 2; }
+"$DUCKDB" "$W/info.duckdb" < tests/make_fake_info.sql >/dev/null || { echo "could not build the fake info data" >&2; exit 2; }
 "$DUCKDB" "$W/cm_old.duckdb" < tests/make_fake_cm_old.sql >/dev/null || { echo "could not build the fake OLD CM data" >&2; exit 2; }
 "$DUCKDB" "$W/cm_new.duckdb" < tests/make_fake_cm_new.sql >/dev/null || { echo "could not build the fake NEW CM data" >&2; exit 2; }
 
@@ -21,6 +22,7 @@ check() {  # name, expected, actual
 }
 metric() { "$DUCKDB" -csv -noheader -c "SELECT value FROM read_csv('$1/summary.csv') WHERE metric = '$2'"; }
 cmmetric() { "$DUCKDB" -csv -noheader -c "SELECT value FROM read_csv('$1/cm_summary.csv') WHERE metric = '$2'"; }
+infometric() { "$DUCKDB" -csv -noheader -c "SELECT value FROM read_csv('$1/info_summary.csv') WHERE metric = '$2'"; }
 rows()   { "$DUCKDB" -csv -noheader -c "SELECT count(*) FROM read_csv('$1')"; }
 # variant NAME 'KEY=value' ...  : the test config plus overrides (a later line wins when the file is read)
 variant() { local n="$1"; shift; { cat tests/test.env; for o in "$@"; do echo "$o"; done; echo "REPORT_DIR=$W/report_$n"; } > "$W/$n.env"; }
@@ -150,6 +152,39 @@ echo "M. a bad CM key column name is refused"
 variant M "${CMCFG[@]}" 'CM_KEY_COLS="CELL_NAME;drop"'
 code=$(run M)
 check "exit code (2 = bad setup)" 2 "$code"
+
+echo "N. info columns: compared and reported separately, the KPI verdict is not changed"
+INFOCFG=(INFO_COMPARE=yes INFO_COLS=SITE_NAME,CELL_NAME,LAC,TAC OLD_DB_FILE=$W/info.duckdb OLD_TABLE=info_old
+  NEW_DB_FILE=$W/info.duckdb NEW_TABLE=info_new NEW_SHAPE=wide NEW_FILTER_COL= NEW_FILTER_VALUE=
+  FAIL_ON_OBJECTS_ONE_SIDE=no FAIL_ON_KPI_COLUMNS_ONE_SIDE=no)
+variant N "${INFOCFG[@]}"
+code=$(run N); R=$W/report_N
+check "exit code stays 0 (KPI values are IDENTICAL although the info columns differ)" 0 "$code"
+check "KPI verdict starts with" IDENTICAL "$(cut -d: -f1 "$R/verdict.txt")"
+check "info verdict starts with" DIFFERENT "$(cut -d: -f1 "$R/info_verdict.txt")"
+check "info objects compared (the object only in new is not one)" 3 "$(infometric $R objects_compared)"
+check "info values compared (3 objects x 4 columns)" 12 "$(infometric $R values_compared)"
+check "info values equal (TAC 57252.00 against 57252 is equal)" 10 "$(infometric $R values_equal)"
+check "info values different" 1 "$(infometric $R values_different)"
+check "info NULL in old only" 1 "$(infometric $R values_null_old_only)"
+check "the info difference is CELL_NAME of 1|2" "1|2,CELL_NAME,c12,c12-X"   "$("$DUCKDB" -csv -noheader -c "SELECT object_key, info_column, old_value, new_value FROM read_csv('$R/info_differences.csv') WHERE kind = 'DIFF'")"
+
+echo "O. INFO_COMPARE=no (default): no info files are written"
+variant O "${INFOCFG[@]}" INFO_COMPARE=no
+code=$(run O); R=$W/report_O
+check "no info_verdict.txt" 0 "$([ -f "$R/info_verdict.txt" ] && echo 1 || echo 0)"
+check "exit code (0 = IDENTICAL)" 0 "$code"
+
+echo "P. a bad INFO_COLS name is refused"
+variant P "${INFOCFG[@]}" 'INFO_COLS="SITE_NAME;drop"'
+code=$(run P)
+check "exit code (2 = bad setup)" 2 "$code"
+
+echo "Q. a tall NEW side has no info columns: the info check is NOT COMPARABLE, the KPI result is as in A"
+variant Q INFO_COMPARE=yes INFO_COLS=CELL_NAME
+code=$(run Q); R=$W/report_Q
+check "exit code (1 = KPI DIFFERENT, as in A)" 1 "$code"
+check "info verdict starts with" "NOT COMPARABLE" "$(cut -d: -f1 "$R/info_verdict.txt")"
 
 echo
 echo "passed: $PASS   failed: $FAIL"
