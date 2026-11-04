@@ -198,7 +198,7 @@ Nothing was saved. Open `reports/<time>_<env>/migrate.log` and read the `ERROR:`
 | `not in TIME_RESOLUTION_MAP` | `COUNTER_DEF` has a TIME_RESOLUTION value the map doesn't know. Add it to `TIME_RESOLUTION_MAP` |
 | `validation failed: …` | The listed check failed. Send `checks.csv` and `migrate.log` to the developer |
 | `column not found` | A name in `COPY_COLUMNS` is wrong. Fix it in `migrate.conf` |
-| `invalid input syntax for type integer` | A copied value doesn't fit V2 (e.g. a `VERSION` like `6.4.0`). Find the row in `COUNTER_DEF` and send it to the developer |
+| `invalid input syntax for type integer` | A copied value doesn't fit V2 (e.g. a non-numeric `MEASUREMENT_ID`). Find the row in `COUNTER_DEF` and send it to the developer |
 | `password authentication failed` / `could not connect` | Check `PG_HOST`, `PG_USER` and `PGPASSWORD` |
 
 ### To undo a live run

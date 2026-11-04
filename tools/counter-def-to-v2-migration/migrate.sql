@@ -109,7 +109,7 @@ CREATE SCHEMA IF NOT EXISTS :"dst_schema";
 CREATE SEQUENCE IF NOT EXISTS :"dst_schema".:"dst_sequence";
 CREATE TABLE IF NOT EXISTS :"dst_schema".:"dst_table" (
     "COUNTER_ID"        INTEGER     PRIMARY KEY,
-    "VERSION"           INTEGER     NOT NULL DEFAULT 1,
+    "VERSION"           VARCHAR     NOT NULL DEFAULT '1',
     "VENDOR"            VARCHAR     NOT NULL,
     "MEASUREMENT_ID"    INTEGER     NOT NULL,
     "COUNTER_NAME"      VARCHAR     NOT NULL,
