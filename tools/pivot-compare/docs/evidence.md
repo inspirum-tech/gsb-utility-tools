@@ -148,3 +148,50 @@ load_old_table: CSV columns that are not in the table: K_-223                   
 ```
 
 Mistake found while testing: `zcat | head -1` under `set -o pipefail` ended the script with exit 141 (broken pipe); fixed with `|| true` and a check that the header is not empty. ✅
+
+## I. List-mode run of 16 NS table pairs, 2026-11-05 (dev server `gsb-dev`, DuckDB v1.5.5, OLD = Postgres `gsb_data_kpi_pivot`, NEW = DuckLake `gsb_data_kpi_pivot_dev`)
+
+Command: `./run.sh config_ns_all.env` (list mode, `pairs_ns.csv`, 16 pairs). Log: `report_ns_all_run_<date>_<time>.log`; per-pair folders in `report_ns_all/`.
+
+### I.1 What data each side holds (checked, not assumed)
+
+OLD (UAT file, all 16 old tables, same result for each, verbatim for NODE_IST: `234552 | 2026-10-25 00:00:00 | 2026-10-25 03:00:00 | 13`):
+13 periods, 2026-10-25 00:00 to 03:00 Sydney = 2026-10-24 13:00 to 16:00 UTC. NOT a full day. Row count of OLD NODE_IST was 234,552 in two checks hours apart: OLD did not change.
+
+NEW (verbatim, `min/max(PERIOD_START_TIME) AT TIME ZONE 'UTC'`): CELL_* and NODE_CEM: 10:15 to 13:15 UTC, 9 periods; NODE_GCUF/IST/MPR/FRU/FRUSU/EP/ROUTER: 8; NODE_RPUPL: 7; NODE_NRSC and NODE_EPXNU: 12:30 to 13:15, 4 periods.
+The NEW tables are CHANGING while we test: NODE_IST first showed `10:15 | 13:00 | 4 periods | last_update 2026-11-05 19:14:38+11`, a few minutes later it ended at 13:15 with 8 periods; an earlier run (window up to 14:15) had listed 1 NEW object at 14:00 which the table no longer holds. Cause not known (possibly the new calculator being run again): ask Pramudi.
+Shared window in all 16 tables today: 13:00 and 13:15 UTC (00:00 and 00:15 Sydney) = 2 periods. Config now `PERIOD_FROM=2026-10-24 13:00:00+00`, `PERIOD_TO=2026-10-24 13:30:00+00` (end excluded).
+Verdict: ⚠️ test covers 2 of the 13 OLD periods; widen `PERIOD_TO` when NEW reaches 16:00 UTC.
+
+Earlier statements that were WRONG and are withdrawn: "OLD holds a full day" (it holds 3 hours) and "NEW stops before 01:00 Sydney" (it moves).
+
+### I.2 Findings that are data gaps or calculator differences (not script problems)
+
+1. `NODE_RIBTM`: ✅ confirmed no NEW table. Verbatim error: `Catalog Error: Table with name KPI_NS_QRLY_NODE_RIBTM_ERS_NEW_P does not exist!` and the NEW schema lists 18 NODE tables, none RIBTM. Removed from `pairs_ns.csv`.
+2. `NODE_GCUF`: OLD column GCUF is always the text `null` (`GCUF | 118663 rows | 9131 sites`), NEW holds `1`.
+3. `NODE_IST` device text differs in format: OLD `Router=Inner_IpsecTunnel=1`, NEW `Router=CP_Inner-IpsecTunnel=1-IpsecTunnel`. So the device column cannot be a key. For GCUF, IST, MPR, ROUTER the key is now `SITE_ID` only (site-level check, repeated devices reduced with max()). SITE_ID agrees on both sides (site 94487: OLD 13 rows, 13 periods). Weaker check than a per-device one.
+4. `CELL_MIXED`: only old=35413, only new=35347. Examples (verbatim): OLD only `1000LaTrobeStIBC-O:M3884-OL07-A-1`, `...-OL07-A-2`, `...-OL23-A-1`; NEW only `...-OL23-B-1`, `...-OL23-B-2`, `...-ON07-B-1`. Cell `...OL07-A-1`: NEW has it in CELL_LTE (7 rows) and in no other NEW cell table; OLD has it in CELL_LTE (13 rows) AND CELL_MIXED (13 rows). So the old calculator puts this cell in both tables, the new one only in LTE. ✅ for this cell, ⏳ not checked for all 35,000.
+
+### I.3 Result of the run, window 13:00 to 13:30 UTC (verbatim totals line: `pairs: 16   identical: 0   different: 16   not comparable: 0   errors: 0`)
+
+| Pair | only old | only new | values compared | different | null in NEW only | null in OLD only | common objects |
+|---|---|---|---|---|---|---|---|
+| CELL_LTE | 2794 | 438 | 6090128 | 278 | 0 | 187224 | 138412 |
+| CELL_NBIOT | 75 | 82 | 10407825 | 356 | 0 | 0 | 22675 |
+| CELL_SG | 70 | 69 | 82152 | 13 | 0 | 0 | 20538 |
+| CELL_5G | 36 | 0 | 2400840 | 235 | 404077 | 0 | 88920 |
+| CELL_MIXED | 35413 | 35347 | 2316660 | 7117 | 0 | 0 | 115833 |
+| NODE_CEM | 45 | 26 | 60192 | 0 | 12 | 0 | 20064 |
+| NODE_GCUF | 37 | 24 | 127512 | 1 | 17964 | 0 | 18216 |
+| NODE_IST | 47 | 26 | 60186 | 0 | 0 | 0 | 20062 |
+| NODE_MPR | 15 | 12 | 138666 | 0 | 0 | 0 | 12606 |
+| NODE_NRSC | 7802 | 99 | 80990 | 0 | 0 | 0 | 80990 |
+| NODE_FRU | 584 | 142 | 1130070 | 0 | 54 | 0 | 113007 |
+| NODE_FRUSU | 21610 | 168 | 797976 | 0 | 0 | 0 | 132996 |
+| NODE_EPXNU | 61275 | 110 | 132332 | 0 | 0 | 0 | 132332 |
+| NODE_EP | 25770 | 34438 | 883542 | 0 | 96460 | 0 | 80322 |
+| NODE_RPUPL | 377 | 377 | 23991492 | 0 | 0 | 0 | 285613 |
+| NODE_ROUTER | 61 | 26 | 401280 | 0 | 0 | 0 | 20064 |
+
+Not yet explained (⏳): the 278/356/13/235/7117 cell differences (cause not looked at; repeated OLD rows reduced with max() is one candidate), CELL_5G 404,077 values empty in NEW (ask Pramudi), NODE_EP only old/only new, NODE_EPXNU/FRUSU/NRSC only old (data gap or NEW still loading), CELL_LTE 187,224 empty in OLD and 7 KPI columns only in OLD.
+Not run: CM comparison (CM_COMPARE=no, PC-13). NODE_PIST and NODE_EPNGU: OLD files being uploaded, not loaded yet.

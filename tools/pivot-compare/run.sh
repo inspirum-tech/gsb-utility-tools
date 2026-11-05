@@ -138,6 +138,13 @@ prep_side() {  # $1 = OLD or NEW
     kexpr+="coalesce(CAST(\"$col\" AS VARCHAR), '<NULL>')"
   done
   IFS="$IFS_OLD"
+  # optional: rewrite the key text with a regex (RE2, \1 for a group) so keys that differ only in format can match,
+  # e.g. NEW_KEY_REGEX_FROM='Inner-(.*)-X$' NEW_KEY_REGEX_TO='Inner_\1'. A key that does not match is left unchanged.
+  local krf krt; krf="$(v KEY_REGEX_FROM)"; krt="$(v KEY_REGEX_TO)"
+  if [ -n "$krf" ]; then
+    case "$krf$krt" in *$'\n'*) die "${P}_KEY_REGEX_FROM/TO must be one line";; esac
+    kexpr="regexp_replace(${kexpr}, '${krf//\'/\'\'}', '${krt//\'/\'\'}')"
+  fi
   NKEYS_COUNT="$(printf '%s' "$keys" | tr ',' '\n' | wc -l | tr -d ' ')"
 
   # period: normalised to a timestamptz (UTC instant); the window test is on the raw column so it can be pushed down
