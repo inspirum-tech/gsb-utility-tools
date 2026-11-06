@@ -87,6 +87,20 @@ dsn_of() {  # $1 = name of the variable or the ENV_FILE key
   printf '%s' "$dsn"
 }
 
+# The DuckDB "postgres" extension is needed to read a Postgres source. Try LOAD first (works with no
+# internet when the extension is already on this machine); INSTALL (a download) only when LOAD fails.
+# If both fail we stop here with one clear message, not in the middle of a run.
+PG_EXT_OK=no
+ensure_pg_ext() {
+  [ "$PG_EXT_OK" = yes ] && return 0
+  if "$DUCKDB" -c "LOAD postgres;" >/dev/null 2>&1; then :
+  elif "$DUCKDB" -c "INSTALL postgres; LOAD postgres;" >/dev/null 2>&1; then :
+  else
+    die "the DuckDB 'postgres' extension is not on this machine and could not be downloaded (no internet?). Copy it once from a machine that has it: ~/.duckdb/extensions/<duckdb version>/<platform>/postgres_scanner.duckdb_extension to the same folder for this user (see README, 'Offline servers')"
+  fi
+  PG_EXT_OK=yes
+}
+
 attach_source() {  # $1 = OLD, NEW or DEF; sets ALIAS (the catalog name to use in SQL)
   local P="$1" side src key v
   side="$(echo "$P" | tr 'A-Z' 'a-z')"
@@ -105,8 +119,8 @@ attach_source() {  # $1 = OLD, NEW or DEF; sets ALIAS (the catalog name to use i
     *)
       case "$src" in
         postgres)
-          ALIAS="cmp_pg_$side"; local dsn; dsn="$(dsn_of "$envname")"
-          ATTACH_SQL+="INSTALL postgres; LOAD postgres;"$'\n'"ATTACH '${dsn//\'/\'\'}' AS ${ALIAS} (TYPE postgres, READ_ONLY);"$'\n' ;;
+          ALIAS="cmp_pg_$side"; local dsn; dsn="$(dsn_of "$envname")"; ensure_pg_ext
+          ATTACH_SQL+="LOAD postgres;"$'\n'"ATTACH '${dsn//\'/\'\'}' AS ${ALIAS} (TYPE postgres, READ_ONLY);"$'\n' ;;
         duckdb)   ALIAS="cmp_db_$side"; ATTACH_SQL+="ATTACH '${f}' AS ${ALIAS} (READ_ONLY);"$'\n' ;;
         attached) ALIAS="$c" ;;
       esac

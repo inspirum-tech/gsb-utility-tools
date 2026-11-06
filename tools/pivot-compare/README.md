@@ -220,3 +220,9 @@ tolerance (and the NaN rule). Recorded output: `docs/local_test_output.txt`, `do
 * A very large comparison (all periods of a day, 60,000 cells x 466 KPIs) is millions of rows per period; set
   `MEMORY_LIMIT`, `TEMP_DIR` and keep the window small on the shared dev server.
 * The comparison is only as meaningful as the input: it cannot tell you that the two calculators were fed the same counters.
+
+## Offline servers (UAT / prod without internet)
+
+Nothing is built or installed: copy the folder, create `.env`, run `bash run.sh <config>.env`. It needs `bash`, the DuckDB CLI file, `python3` (only for `FINAL_REPORT=yes`, standard library only) and network access to the databases.
+
+One item to check: reading a Postgres source needs the DuckDB `postgres` extension. `run.sh` tries `LOAD postgres` first (no internet needed) and `INSTALL postgres` (a download) only if that fails; if both fail it stops at the start with a clear message. On a server without internet, copy the extension once from a machine that has it (the dev server): `~/.duckdb/extensions/<duckdb version>/<platform>/postgres_scanner.duckdb_extension` to the same folder for the user that runs the tool. Check with: `<duckdb> -c "LOAD postgres;"` (no output means it works).

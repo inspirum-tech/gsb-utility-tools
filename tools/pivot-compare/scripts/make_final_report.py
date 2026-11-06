@@ -378,6 +378,8 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
     env = rows[0]["env"]
     notes = read_notes(notes_path)
     today = datetime.date.today().strftime("%d-%m-%Y")
+    # when the comparison finished = when pairs_summary.csv was last written (server local time)
+    run_time = datetime.datetime.fromtimestamp(os.path.getmtime(os.path.join(report_dir, "pairs_summary.csv"))).strftime("%Y-%m-%d %H:%M")
     n = len(rows)
     ok = [r for r in rows if r["compared"] is not None]
     tot = lambda k: sum(r[k] or 0 for r in rows)
@@ -450,7 +452,8 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
         ["Empty in NEW only / OLD only", "The object is on both sides; one side has a number and the other is empty."],
         ["Objects only in OLD / NEW", "An object (cell or node and period) found in one table but not the other."],
         ["Tolerance", "absolute %s, relative %s (equal when abs(old-new) <= abs + rel*abs(old))" % (env.get("TOLERANCE_ABS", "?"), env.get("TOLERANCE_REL", "?"))],
-        ["Period", period]], [30, 130]))
+        ["Period", period],
+        ["Data as of", "Comparison finished %s (server time). Data that arrives later or a change in the NEW calculator can change the result." % run_time]], [30, 130]))
     if fingerprint_path and os.path.isfile(fingerprint_path):
         fp = read_csv_rows(fingerprint_path)
         if fp:
@@ -466,7 +469,7 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
     D = Doc()
     D.p(title + "\nOLD (Java) calculator vs NEW KPI calculator", bold=True, size=20, center=True, color="1F3864")
     D.p("Test Summary Report (TSR)", bold=True, size=16, center=True)
-    D.p("Version: Draft\nDate: %s\nAuthor: %s\nThis is a comparison report, not a production sign-off." % (today, author or "(not set)"))
+    D.p("Version: Draft\nDate: %s\nComparison finished: %s (server time)\nAuthor: %s\nThis is a comparison report, not a production sign-off." % (today, run_time, author or "(not set)"))
     D.table(["Role", "Name", "Department", "Signature / email", "Date of approval"], [["Approver", "", "", "", ""], ["Reviewer", "", "", "", ""]], [3, 4, 3.5, 4, 3])
     D.h(1, "1. Executive Summary")
     D.h(2, "1.1 Test Phase Summary")
@@ -480,6 +483,7 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
                                   ["NEW side", "%s: schema %s (period column %s, %s)" % (env.get("NEW_SOURCE", "?"), env.get("NEW_SCHEMA", "?"), env.get("NEW_PERIOD_COL", "?"), env.get("NEW_PERIOD_TZ", "?"))],
                                   ["Test stub", "No"], ["Report built", today]], [4, 13])
     D.h(2, "1.3 Test Data Setup")
+    D.p("All statements in this report describe the OLD and NEW data as they were when the comparison finished (%s). The NEW calculator is still under test: data that arrives later, or a change of its logic, can change the result, and a value that is missing in NEW now may be present after a later run." % run_time)
     if fingerprint_path and os.path.isfile(fingerprint_path):
         D.p("The NEW tables may change while they are being tested. The results workbook has a sheet 'NEW data tested' (row count, periods and last update of each NEW table in the tested window) that shows which NEW data was compared. If that data changes, the comparison has to be run again.")
     else:
