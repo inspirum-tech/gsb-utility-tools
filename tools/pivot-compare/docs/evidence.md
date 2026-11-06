@@ -195,3 +195,45 @@ Earlier statements that were WRONG and are withdrawn: "OLD holds a full day" (it
 
 Not yet explained (⏳): the 278/356/13/235/7117 cell differences (cause not looked at; repeated OLD rows reduced with max() is one candidate), CELL_5G 404,077 values empty in NEW (ask Pramudi), NODE_EP only old/only new, NODE_EPXNU/FRUSU/NRSC only old (data gap or NEW still loading), CELL_LTE 187,224 empty in OLD and 7 KPI columns only in OLD.
 Not run: CM comparison (CM_COMPARE=no, PC-13). NODE_PIST and NODE_EPNGU: OLD files being uploaded, not loaded yet.
+
+## J. Keys and the final window, 2026-11-05 evening (window 2026-10-24 13:00 to 13:50 UTC = 4 periods 13:00, 13:15, 13:30, 13:45; 18 pairs; OLD and NEW as in section I)
+
+### J.1 Fingerprint of the NEW tables in the test window (proof of which NEW data was tested)
+
+Command: one `SELECT count(*), count(distinct PERIOD_START_TIME), max(PERIOD_START_TIME), max(UPDATE_TIMESTAMP)` per NEW table over the window (`fingerprint.sql`, saved result `fingerprint_new_testwindow_<date>_<time>.csv`). All 18 tables: 4 periods, last update `2026-11-05 20:26:05.224+11`. Rows: CELL_LTE 347169, CELL_NBIOT 56881, CELL_SG 57028, CELL_5G 222268, CELL_MIXED 377886, NODE_CEM 50249, GCUF 45602, IST 90165, MPR 31541, NRSC 202263, FRU 282869, FRUSU 337638, EPXNU 319055, EP 291802, RPUPL 699849, ROUTER 886072, PIST 8150606, EPNGU 4287110.
+Use: before the final run take the same fingerprint again; any difference means the NEW data changed after this test (the NEW calculator is still being run on dev: two writes of the same rows at 18:51 and 19:29 were seen for cell 81717|66).
+
+### J.2 What was found about the keys (each with its proof)
+
+1. `SITE_ID` is not the same on both sides for some sites. NODE_PIST: `Rossmore-NSW-O-32TN-407415-NR35-E-S123` has OLD SITE_ID 407415 and NEW SITE_ID 1311245 (OLD query `407415 | 2704 rows`, NEW query `1311245 | 1664 rows`). With key SITE_ID;PIST: only old=133685 only new=6575, common 6513873; with key SITE_NAME;PIST: only old=127174 only new=0, common 6520448, different=0 in both.
+2. The device text differs in format (OLD `Router=CP_Inner_PeerIpsecTunnel=10.203.69.182-1`, NEW `Router=CP_Inner-PeerIpsecTunnel=10.203.69.182-1-PeerIpsecTunnel`). For NODE_PIST handled with `NEW_KEY_REGEX_FROM/TO` (new option in run.sh); with it common objects went from 0 to 6513873. NOT handled for GCUF (OLD always `null`), IST, MPR, ROUTER (NEW has a router prefix like `CP_`/`NR_CUP_`): those four compare by SITE_NAME only (site level, max() over devices), a weaker check.
+3. `CELL_ID` is not a safe key for LTE. Site 81717, 2026-10-24 13:00 UTC, K_-11: OLD has `CELL_ID 66` twice (`...S0247-OL21-C-12` = 41869 and `...C-2` = 113507) and `CELL_ID 67` = `...C-3` (408838); NEW has 66 = `C-12` (41869) and 67 = `C-2` (113507). Values agree BY NAME. With key SITE_ID;CELL_ID CELL_LTE had different=545 (410 on cells with repeated rows), CELL_NBIOT 601; with key CELL_NAME CELL_LTE different=6, CELL_NBIOT different=0.
+4. The OLD LTE table also holds relation-level rows: CELL_NAME like `EUtranCellFDD=AnzacVlg-V:S8703-OL21-C-3_UtranFreqRelation=U09_3046_UtranCellRelation=5052-1053` (about 108 to 112 rows per name). Of the 213369 OLD-only objects in CELL_LTE, 213231 are such rows and 138 are plain cells (`awk` count). The NEW LTE table does not hold them. This also explains the OLD-only KPI columns and the OLD empty values. Which NEW table (if any) holds the relation rows: ⏳ ask Pramudi.
+
+### J.3 Result of the last run of each pair (verbatim lines; node tables from `report_ns_name`, cell tables from `report_cells`, key CELL_NAME)
+
+| Pair | only old | only new | values compared | different | empty in NEW only | empty in OLD only | common objects |
+|---|---|---|---|---|---|---|---|
+| CELL_LTE | 213369 (213231 relation rows, 138 plain) | 0 | 12221132 | 6 | 0 | 374624 | 277753 |
+| CELL_NBIOT | 27 | 0 | 20888172 | 0 | 0 | 0 | 45508 |
+| CELL_SG | 25 | 0 | 182504 | 48 | 0 | 0 | 45626 |
+| CELL_5G | 90 | 0 | 4801140 | 397 | 813640 | 0 | 177820 |
+| CELL_MIXED | 72239 | 72065 | 4605200 | 14811 | 0 | 0 | 230260 |
+| NODE_CEM | 21 | 0 | 120600 | 0 | 24 | 0 | 40200 |
+| NODE_GCUF | 26 | 0 | 255381 | 1 | 36420 | 0 | 36483 |
+| NODE_IST | 21 | 0 | 120600 | 0 | 0 | 0 | 40200 |
+| NODE_MPR | 13 | 0 | 277574 | 0 | 0 | 0 | 25234 |
+| NODE_NRSC | 15966 | 0 | 161616 | 0 | 0 | 0 | 161616 |
+| NODE_FRU | 884 | 0 | 2263020 | 585 | 2564 | 0 | 226302 |
+| NODE_FRUSU | 42846 | 0 | 1620714 | 0 | 0 | 0 | 270119 |
+| NODE_EPXNU | 119046 | 0 | 251252 | 0 | 0 | 0 | 251252 |
+| NODE_EP | 51248 | 68620 | 1813064 | 0 | 193160 | 0 | 164824 |
+| NODE_RPUPL | 10 | 0 | 46653600 | 0 | 0 | 0 | 555400 |
+| NODE_ROUTER | 21 | 0 | 879440 | 0 | 0 | 0 | 43972 |
+| NODE_PIST | 127174 | 0 | 32602240 | 0 | 573 | 0 | 6520448 |
+| NODE_EPNGU | 33887 | 0 | 57751244 | 0 | 7663169 | 0 | 3397132 |
+
+Totals line of the 18-pair run: `pairs: 18   identical: 0   different: 18   not comparable: 0   errors: 0`. No pair is identical: every pair has at least objects only in OLD or empty values in NEW. ✅ no script error seen.
+
+### J.4 Still not explained (⏳)
+CELL_LTE 6, CELL_SG 48, CELL_5G 397 different values; NODE_FRU 585 different; CELL_MIXED 14811 different and 72239/72065 one-sided (classification differs, shown for one cell only); CELL_5G 813640 and NODE_EPNGU 7663169 empty in NEW; NODE_EP 51248 old-only and 68620 new-only (key not yet understood); OLD-only sites in NODE_PIST/EPXNU/FRUSU/EPNGU/NRSC (NEW has no rows for them; shown for one site). Not run: CM comparison. Window is 4 of 13 OLD periods (NEW still being filled).

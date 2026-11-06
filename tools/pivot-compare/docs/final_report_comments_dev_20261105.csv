@@ -1,0 +1,13 @@
+name,comment
+CELL_LTE,"213,231 of the OLD-only objects are relation-level rows held by the OLD table. The 6 different values are 3 cells x K_-18 and K_-19 at 13:30. The values empty in OLD (374,624) are not investigated."
+CELL_SG,"Largest: FlindersStStation-VIC-O-13FS-OLNR21-CA-2 K_-12 OLD 7415506 vs NEW 1433782 (the same cell is also in CELL_MIXED). Cause not analysed."
+CELL_5G,"Cause of the different values not analysed. The values empty in NEW are not investigated."
+CELL_MIXED,"Cause not analysed. One cell was confirmed to be written by OLD to both LTE and MIXED but by NEW to LTE only; other cells not checked."
+NODE_GCUF,"Compared per site only. K_-367 OLD 2558698 vs NEW 1279513 (about double); cause not proven. Values empty in NEW not investigated."
+NODE_IST,"Compared per site only, a weaker check."
+NODE_MPR,"Compared per site only, a weaker check."
+NODE_ROUTER,"Compared per site only, a weaker check."
+NODE_PIST,"Compared over 6,520,448 tunnels after the NEW tunnel text was rewritten to the OLD form."
+NODE_FRU,"Cause not analysed."
+NODE_EP,"OLD-only and NEW-only objects: pairing not analysed. Values empty in NEW not investigated."
+NODE_EPNGU,"Values empty in NEW not investigated."

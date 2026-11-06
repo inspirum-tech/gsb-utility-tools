@@ -115,6 +115,33 @@ found *and* there is something in common. Nothing in common is `NOT COMPARABLE`,
 * A NULL on one side and a value on the other is reported, not hidden (`NULL_AS_DEFAULT=no`). A KPI that is NULL on
   both sides counts as equal.
 
+## Final output to share (optional, `FINAL_REPORT=yes`, list mode)
+
+The report folder holds raw files. For a reader (a lead, a reviewer) the run can also build one folder to hand over, the
+same on dev or UAT. It reads the report folder and writes a **new** folder `<REPORT_DIR>_FINAL_OUTPUT_RESULT` (it refuses to
+overwrite one, and never touches the databases or the report folder):
+
+```
+Test Summary Report - <title>.docx   Word report, chapters like the team's Test Summary Report template
+<title> - Results.xlsx               one line per table (status, counts, comment) + how to read + NEW data tested + open items
+<TABLE>/                             one folder per table, same pattern: <TABLE> - results.xlsx + summary.txt
+Supporting_details/                  copy of the raw report folder (duplicate_keys.csv and files over 5 MB left out, listed in NOT_COPIED.txt)
+```
+
+The whole folder is also written as one zip next to it (`<REPORT_DIR>_FINAL_OUTPUT_RESULT.zip`), so there is one file to download.
+
+* **Status** per table: `PASS` only with 0 different values, nothing on one side only, nothing empty on one side and no KPI column
+  on one side only. Otherwise `NOT MET`, with the numbers in the comment. The column "All paired values equal?" shows the
+  tables whose paired values are all equal even when objects are missing on one side.
+* Everything numeric (counts, KPIs with different values, keys, period, tolerance) is built from the run itself. What a person
+  has confirmed (out of scope, variations, observations, open items, conclusion) comes from the optional `FINAL_REPORT_NOTES_FILE`
+  and `FINAL_REPORT_COMMENTS_FILE`; without them those chapters say "None recorded for this run". Example files:
+  `docs/final_report_notes_dev_20261105.md`, `docs/final_report_comments_dev_20261105.csv`.
+* Needs `python3` (standard library only). Without it a message is printed; the comparison result and exit code never change.
+* By hand: `python3 scripts/make_final_report.py REPORT_DIR OUT_DIR --title "NS Pivot Comparison" --notes notes.md`.
+* `config_used.env` of every table now ends with the values that table really used (`OLD_TABLE`, `NEW_TABLE`, key and info
+  columns): in list and auto mode they differ from the base config lines above them, and the last line wins.
+
 ## Info columns (optional, `INFO_COMPARE=yes`)
 
 The KPI values are the calculator's output. Columns such as `SITE_NAME`, `CELL_NAME`, `LAC`, `SAC`, `TAC` are labels copied from

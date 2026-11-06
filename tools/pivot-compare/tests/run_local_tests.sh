@@ -202,6 +202,48 @@ check "rows in pairs_summary.csv (3 pairs)" 3 "$(rows $R/pairs_summary.csv)"
 check "the broken pair is an ERROR" ERROR "$("$DUCKDB" -csv -noheader -c "SELECT result FROM read_csv('$R/pairs_summary.csv') WHERE name = 'broken'")"
 check "info columns only for the pair that asks for them" "1,0" "$([ -f "$R/first/info_verdict.txt" ] && echo -n 1 || echo -n 0),$([ -f "$R/second/info_verdict.txt" ] && echo 1 || echo 0)"
 
+echo "S. FINAL_REPORT=yes in list mode builds the Word report + Excel sheets; a report problem never changes the exit code"
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then echo "  skipped (python not found)"; else
+printf 'name,old_table,new_table,key_cols,info_cols
+first,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,CELL_NAME
+second,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,
+' > "$W/pairs2.csv"
+variant S MODE=list "PAIRS_FILE=$W/pairs2.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes FINAL_REPORT=yes "FINAL_REPORT_DIR=$W/final_S" 'FINAL_REPORT_AUTHOR=Test Person'
+code=$(run S); R=$W/report_S; F=$W/final_S
+check "exit code is still the comparison result (1 = DIFFERENT)" 1 "$code"
+check "Word report exists" 1 "$([ -s "$F/Test Summary Report - NS Pivot Comparison.docx" ] && echo 1 || echo 0)"
+check "one zip of the whole output folder exists" 1 "$([ -s "$F.zip" ] && echo 1 || echo 0)"
+check "Results workbook exists" 1 "$([ -s "$F/NS Pivot Comparison - Results.xlsx" ] && echo 1 || echo 0)"
+check "one results workbook per table" "1,1" "$([ -s "$F/first/first - results.xlsx" ] && echo -n 1 || echo -n 0),$([ -s "$F/second/second - results.xlsx" ] && echo 1 || echo 0)"
+check "run folder was copied to Supporting_details" 1 "$([ -f "$F/Supporting_details/pairs_summary.csv" ] && echo 1 || echo 0)"
+check "config_used.env of a table records the key columns it really used" "OLD_KEY_COLS=SITE_ID,CELL_ID" "$(grep '^OLD_KEY_COLS=' "$R/first/config_used.env" | tail -1)"
+check "config_used.env of a table records its own old table" "OLD_TABLE=old_pivot" "$(grep '^OLD_TABLE=' "$R/second/config_used.env" | tail -1)"
+check "every XML part of the Word and Excel files is well formed" "OK" "$("$PY" -I -c "
+import sys, zipfile, xml.dom.minidom as m
+f = sys.argv[1]
+for p in ['Test Summary Report - NS Pivot Comparison.docx', 'NS Pivot Comparison - Results.xlsx', 'first/first - results.xlsx']:
+    z = zipfile.ZipFile(f + '/' + p)
+    for n in z.namelist():
+        m.parseString(z.read(n))
+print('OK')
+" "$F" 2>&1 | tail -1)"
+check "the Results sheet says NOT MET for table first" 1 "$("$PY" -I -c "
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1] + '/NS Pivot Comparison - Results.xlsx')
+print(1 if 'NOT MET' in z.read('xl/worksheets/sheet1.xml').decode() else 0)
+" "$F")"
+# the same run again: the output folder exists, nothing is overwritten, and the exit code is unchanged
+code=$(run S)
+check "second run: exit code unchanged (1)" 1 "$code"
+check "second run: says the folder already exists" 1 "$(grep -c 'already exists' "$W/S.out")"
+# a bad report setting only stops the report
+variant S2 MODE=list "PAIRS_FILE=$W/pairs2.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes FINAL_REPORT=yes "FINAL_REPORT_DIR=$W/final_S2" 'FINAL_REPORT_TITLE=bad;title'
+code=$(run S2)
+check "bad FINAL_REPORT_TITLE: exit code unchanged (1)" 1 "$code"
+check "bad FINAL_REPORT_TITLE: no report folder" 0 "$([ -d "$W/final_S2" ] && echo 1 || echo 0)"
+fi
+
 echo
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

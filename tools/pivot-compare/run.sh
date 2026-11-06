@@ -244,6 +244,10 @@ UPDATE new_cols SET kpi = m.old_kpi FROM kpimap m WHERE new_cols.kpi = m.new_kpi
   mkdir -p "$REPORT_DIR"
   printf '%s' "$SQL_BODY" > "$REPORT_DIR/generated.sql"   # no connection strings in it
   cp "$CONFIG" "$REPORT_DIR/config_used.env"
+  # list and auto mode override some settings per table; record the values this table really used (the last line wins)
+  { printf '\n# ---- effective values for this table (list / auto mode override the lines above) ----\n'
+    for ev in OLD_TABLE NEW_TABLE OLD_KEY_COLS NEW_KEY_COLS INFO_COMPARE INFO_COLS; do printf '%s=%s\n' "$ev" "${!ev-}"; done
+  } >> "$REPORT_DIR/config_used.env"
   local T; T="$(mktemp -d)"; chmod 700 "$T"
   printf '%s\n%s\n%s' "$ATTACH_SQL" "$(duck_settings)" "$SQL_BODY" > "$T/run.sql"
 
@@ -326,6 +330,33 @@ run_cm() {  # $1 = folder for the CM report files; returns 0 IDENTICAL, 1 DIFFER
   esac
 }
 
+# ---- final output (FINAL_REPORT=yes, list mode): Word report + Excel sheets built from the report folder -----------
+# Optional and read only: it reads REPORT_DIR and writes a NEW folder. A failure here only prints a message; the exit code is
+# never changed by it. Needs python3 (standard library only, nothing to install). See scripts/make_final_report.py.
+FINAL_REPORT="${FINAL_REPORT:-no}"; need_yesno FINAL_REPORT
+make_final_report() {
+  local PY out args=()
+  PY="$(command -v python3 || command -v python || true)"
+  if [ -z "$PY" ]; then echo "final report skipped: python3 was not found (the comparison itself is complete)" >&2; return 0; fi
+  out="${FINAL_REPORT_DIR:-${REPORT_DIR%/}_FINAL_OUTPUT_RESULT}"
+  need_path out
+  local t="${FINAL_REPORT_TITLE:-NS Pivot Comparison}" a="${FINAL_REPORT_AUTHOR:-}"
+  [[ "$t" =~ ^[A-Za-z0-9\ _-]+$ ]] || die "FINAL_REPORT_TITLE may hold letters, digits, space, _ and - only"
+  [[ "$a" =~ ^[A-Za-z0-9\ ._-]*$ ]] || die "FINAL_REPORT_AUTHOR may hold letters, digits, space, . _ and - only"
+  args=(--title "$t" --author "$a")
+  local v f
+  for v in NOTES COMMENTS FINGERPRINT; do
+    f="FINAL_REPORT_${v}_FILE"; opt_path "$f"
+    if [ -n "${!f:-}" ]; then
+      [ -f "${!f}" ] || die "$f not found: ${!f}"
+      args+=("--$(echo "$v" | tr 'A-Z' 'a-z')" "${!f}")
+    fi
+  done
+  "$PY" "$TOOL_DIR/scripts/make_final_report.py" "$REPORT_DIR" "$out" "${args[@]}" \
+    || echo "final report was not written (see the message above); the comparison itself is complete" >&2
+  return 0
+}
+
 combine_rc() {  # $1 = KPI result code, $2 = CM result code -> overall exit code (a CM difference makes the run DIFFERENT)
   if [ "$1" -eq 2 ] || [ "$2" -eq 2 ]; then echo 2
   elif [ "$1" -eq 1 ] || [ "$2" -eq 1 ]; then echo 1
@@ -381,6 +412,9 @@ if [ "$MODE" = list ]; then
   echo
   echo "pairs: $N_RUN   identical: $N_IDENT   different: $N_DIFF   not comparable: $N_NC   errors: $N_ERR"
   echo "summary: $SUMMARY     details per pair: $BASE/<name>/"
+  if [ "$FINAL_REPORT" = yes ]; then   # in a subshell: a wrong FINAL_REPORT_* setting stops only the report, never the result
+    ( REPORT_DIR="$BASE"; make_final_report ) || echo "final report not written (see the message above); the comparison itself is complete" >&2
+  fi
   if [ "$N_ERR" -gt 0 ]; then exit 2
   elif [ "$N_DIFF" -gt 0 ]; then exit 1
   elif [ "$N_RUN" -eq 0 ] || [ "$N_NC" -gt 0 ]; then exit 3
