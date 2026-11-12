@@ -64,6 +64,53 @@ def num(detail, key):
     return int(m.group(1)) if m else None
 
 
+def read_summary(folder):
+    """summary.csv of one table (metric,value) as a dict; empty when the file is missing."""
+    p = os.path.join(folder, "summary.csv")
+    out = {}
+    if os.path.isfile(p):
+        for r in read_csv_rows(p)[1:]:
+            if len(r) >= 2:
+                out[r[0]] = r[1]
+    return out
+
+
+def pct_of(r):
+    """percent of the compared values that are equal (empty values count as not equal)"""
+    if r.get("compared") and r.get("equal_n") is not None:
+        return "%.2f%%" % (100.0 * r["equal_n"] / r["compared"])
+    return "n/a"
+
+
+def periods_text(r):
+    """period coverage of one table, from summary.csv of the run"""
+    if r.get("p_total") is None:
+        return "n/a"
+    s = "%d of %d periods on both sides" % (r["p_both"], r["p_total"])
+    if r.get("p_old"): s += "; %d only in OLD" % r["p_old"]
+    if r.get("p_new"): s += "; %d only in NEW" % r["p_new"]
+    return s
+
+
+def dup_text(r):
+    """repeated rows of one table, from summary.csv of the run"""
+    if r.get("dup") is None:
+        return "n/a"
+    if not r["dup"]:
+        return "none"
+    if r.get("dup_conflict") is None:
+        return "%s (conflicts not measured in this run)" % fmt(r["dup"])
+    return "%s (%s conflicting)" % (fmt(r["dup"]), fmt(r["dup_conflict"]))
+
+
+def dup_total_text(rows):
+    """repeated rows over all tables; says so when some run folders did not measure the conflicts"""
+    total = sum(r.get("dup") or 0 for r in rows)
+    if any(r.get("dup") and r.get("dup_conflict") is None for r in rows):
+        return "%s in total (conflicts not measured in this run)" % fmt(total)
+    return "%s in total, %s with conflicting values" % (fmt(total), fmt(sum(r.get("dup_conflict") or 0 for r in rows)))
+
+
 def read_notes(path):
     sections, cur = {}, None
     if path and os.path.isfile(path):
@@ -101,14 +148,36 @@ def load_run(report_dir, comments):
         t["folder"] = folder
         t["env"] = read_env(os.path.join(folder, "config_used.env"))
         has = t["compared"] is not None
-        if res == "IDENTICAL":
-            t["status"] = "PASS"
-        elif not has:
+        # "values compared" = common objects x common KPI columns, so it also holds the values that are empty on one side.
+        # Equal values come from summary.csv (values_equal); a run without it: compared - different - empty on one side.
+        t["mismatch"] = ((t["different"] or 0) + (t["null_old"] or 0) + (t["null_new"] or 0)) if has else None
+        t["equal_n"] = None
+        sm = read_summary(folder) if has else {}
+        if has:
+            try:
+                t["equal_n"] = int(sm["values_equal"])
+            except (KeyError, ValueError):
+                t["equal_n"] = t["compared"] - t["mismatch"]
+
+        def smi(key):      # an integer from summary.csv; None when the run was made by an older version without that metric
+            try:
+                return int(sm[key])
+            except (KeyError, ValueError):
+                return None
+        t["dup"], t["dup_conflict"] = smi("duplicate_entries"), smi("conflicting_duplicates")
+        t["p_both"], t["p_old"], t["p_new"], t["p_total"] = smi("periods_on_both_sides"), smi("periods_only_old"), smi("periods_only_new"), smi("periods_total")
+        # PASS follows its own definition, whatever the FAIL_ON_* settings of the run were (those only set the exit code):
+        # 0 different, nothing on one side only, no value empty on one side, no KPI column on one side only,
+        # no repeated row whose values conflict (max() could hide a difference).
+        if not has:
             t["status"] = res          # NOT COMPARABLE or ERROR: no numbers
         else:
-            clean = all((t[k] or 0) == 0 for k in ("different", "only_old", "only_new", "null_old", "null_new", "kpi_old", "kpi_new"))
+            clean = all((t[k] or 0) == 0 for k in ("different", "only_old", "only_new", "null_old", "null_new", "kpi_old", "kpi_new", "dup_conflict", "p_old", "p_new"))
+            # repeated rows whose conflicts were not measured (a run from an older version) cannot be called clean
+            clean = clean and not (t["dup_conflict"] is None and (t["dup"] or 0) > 0)
             t["status"] = "PASS" if clean else "NOT MET"
-        t["equal"] = "n/a" if not has else ("Yes" if t["different"] == 0 else "No")
+        # Yes only when nothing differs or is empty on one side AND no repeated row has conflicting values (max() could hide a difference)
+        t["equal"] = "n/a" if not has else ("Yes" if t["mismatch"] == 0 and not (t["dup_conflict"] or 0) else "No")
         t["auto"], t["top_kpis"], t["example"] = auto_comment(t)
         t["comment"] = t["auto"] + ((" " + comments[name]) if name in comments else "")
         rows.append(t)
@@ -171,14 +240,22 @@ def auto_comment(t):
     parts = []
     if t["different"]:
         parts.append("%s different value%s" % (fmt(t["different"]), "" if t["different"] == 1 else "s"))
-    else:
+    elif not t["null_old"] and not t["null_new"]:
         parts.append("All %s compared values equal" % fmt(t["compared"]))
+    else:
+        parts.append("0 different values among the values filled on both sides")
     if t["only_old"]: parts.append("%s objects only in OLD" % fmt(t["only_old"]))
     if t["only_new"]: parts.append("%s objects only in NEW" % fmt(t["only_new"]))
     if t["null_new"]: parts.append("%s values empty in NEW only" % fmt(t["null_new"]))
     if t["null_old"]: parts.append("%s values empty in OLD only" % fmt(t["null_old"]))
     if t.get("kpi_old"): parts.append("%d KPI column%s only in OLD" % (t["kpi_old"], "" if t["kpi_old"] == 1 else "s"))
     if t.get("kpi_new"): parts.append("%d KPI column%s only in NEW" % (t["kpi_new"], "" if t["kpi_new"] == 1 else "s"))
+    if t.get("p_old"): parts.append("%d period%s only in OLD" % (t["p_old"], "" if t["p_old"] == 1 else "s"))
+    if t.get("p_new"): parts.append("%d period%s only in NEW" % (t["p_new"], "" if t["p_new"] == 1 else "s"))
+    if t.get("dup"):
+        cf = t.get("dup_conflict")      # None = the run was made by a version that did not measure conflicts
+        tail = "" if cf is None else ((", %s with conflicting values" % fmt(cf)) if cf else ", none with conflicting values")
+        parts.append("%s repeated row%s on one side (the larger value is used)%s" % (fmt(t["dup"]), "" if t["dup"] == 1 else "s", tail))
     top = kpi_diffs(t["folder"])
     if top:
         parts.append("KPIs with different values: " + ", ".join("%s (%s)" % (k, fmt(n)) for k, n in top[:4]))
@@ -385,13 +462,17 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
     tot = lambda k: sum(r[k] or 0 for r in rows)
     t_cmp, t_dif = tot("compared"), tot("different")
     n_pass = sum(1 for r in rows if r["status"] == "PASS")
-    n_zero = sum(1 for r in ok if r["different"] == 0)
+    n_zero = sum(1 for r in ok if r["equal"] == "Yes")      # tables where every compared value is equal (none empty on one side, no conflicting repeat)
     n_nc = sum(1 for r in rows if r["status"] == "NOT COMPARABLE")
     n_err = sum(1 for r in rows if r["status"] == "ERROR")
     n_notmet = sum(1 for r in rows if r["status"] == "NOT MET")
-    pct = (100.0 * (t_cmp - t_dif) / t_cmp) if t_cmp else 0.0
+    n_period_issue = sum(1 for r in rows if (r.get("p_old") or 0) + (r.get("p_new") or 0) > 0)   # tables with a period on one side only
+    t_eq = sum(r["equal_n"] or 0 for r in rows)
+    t_empty = tot("null_old") + tot("null_new")
+    pct = (100.0 * t_eq / t_cmp) if t_cmp else 0.0           # empty values count as NOT equal
     period = period_text(env)
-    zero_names = [r["name"] for r in ok if r["different"] == 0]
+    zero_names = [r["name"] for r in ok if r["different"] == 0 and not (r.get("dup_conflict") or 0)]
+    conflict_rows = sorted([r for r in ok if (r.get("dup_conflict") or 0) > 0], key=lambda r: -r["dup_conflict"])
     diff_rows = sorted([r for r in ok if r["different"]], key=lambda r: -r["different"])
 
     os.makedirs(out_dir)
@@ -400,15 +481,19 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
         d = os.path.join(out_dir, r["name"]); os.makedirs(d)
         sums = [["Item", "Value"], ["Table", r["name"]], ["Status", (r["status"], S_GRN if r["status"] == "PASS" else S_RED)],
                 ["Paired by (key columns)", (r["env"].get("OLD_KEY_COLS") or "").replace(",", " + ")],
-                ["Values compared (filled on both sides)", r["compared"]], ["Values different", r["different"]],
+                ["Values compared (common objects x common KPI columns)", r["compared"]], ["Values equal", r["equal_n"]], ["Percent equal", pct_of(r)], ["Values different", r["different"]],
                 ["Values empty in NEW only", r["null_new"]], ["Values empty in OLD only", r["null_old"]],
                 ["Objects on both sides", r["common"]], ["Objects only in OLD", r["only_old"]], ["Objects only in NEW", r["only_new"]],
-                ["KPI columns only in OLD", r["kpi_old"]], ["KPI columns only in NEW", r["kpi_new"]], ["Comment", (r["comment"], S_WRAP)]]
+                ["KPI columns only in OLD", r["kpi_old"]], ["KPI columns only in NEW", r["kpi_new"]],
+                ["Periods", periods_text(r)], ["Repeated rows on one side", dup_text(r)], ["Comment", (r["comment"], S_WRAP)]]
         s1 = simple_sheet("Summary", sums, [42, 110])
         sheets = [s1]
         kp = os.path.join(r["folder"], "kpi_summary.csv")
         if os.path.isfile(kp):
             sheets.append(simple_sheet("KPI summary", read_csv_rows(kp), [14, 14, 14, 14, 16, 16, 18]))
+        pp = os.path.join(r["folder"], "period_summary.csv")
+        if os.path.isfile(pp):
+            sheets.append(simple_sheet("Periods", read_csv_rows(pp), [18, 14, 14, 14, 14, 16, 16, 16, 16, 16, 18, 18]))
         h, keep, best, total = diff_stream(r["folder"])
         if h:
             note = None
@@ -430,27 +515,31 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
         write_xlsx(os.path.join(d, "%s - results.xlsx" % r["name"]), sheets)
         with open(os.path.join(d, "summary.txt"), "w", encoding="utf-8") as f:
             f.write("%s  (%s table)\nStatus: %s\n\nPeriod: %s\nOLD: %s.%s   NEW: %s.%s\n\n" % (r["name"], r["level"].lower(), r["status"], period, r["env"].get("OLD_SCHEMA", "?"), r["env"].get("OLD_TABLE", "?"), r["env"].get("NEW_SCHEMA", "?"), r["env"].get("NEW_TABLE", "?")))
-            for lab, k in (("Values compared", "compared"), ("Values different", "different"), ("Empty in NEW only", "null_new"), ("Empty in OLD only", "null_old"), ("Objects on both sides", "common"), ("Objects only in OLD", "only_old"), ("Objects only in NEW", "only_new")):
+            for lab, k in (("Values compared", "compared"), ("Values equal", "equal_n"), ("Values different", "different"), ("Empty in NEW only", "null_new"), ("Empty in OLD only", "null_old"), ("Objects on both sides", "common"), ("Objects only in OLD", "only_old"), ("Objects only in NEW", "only_new")):
                 f.write("%-26s%s\n" % (lab + ":", fmt(r[k]) if r[k] is not None else "n/a"))
+            f.write("%-26s%s\n%-26s%s\n" % ("Periods:", periods_text(r), "Repeated rows:", dup_text(r)))
             f.write("\nComment: %s\n" % r["comment"])
             if r["example"]:
                 f.write("Largest difference: %s\n" % " | ".join(r["example"]))
             f.write("\nSame pattern in every table folder: this file and one results workbook.\nRaw files: ../Supporting_details\n")
 
     # ---- overall workbook
-    hdr = ["Table", "Level", "Status", "All paired values equal?", "Values compared", "Values different", "Empty in NEW only", "Empty in OLD only", "Objects only in OLD", "Objects only in NEW", "Comment"]
+    hdr = ["Table", "Level", "Status", "All paired values equal?", "Values compared", "Values equal", "% equal", "Values different", "Empty in NEW only", "Empty in OLD only", "Objects only in OLD", "Objects only in NEW", "Periods", "Repeated rows (conflicting)", "Comment"]
     res = [[(h, S_HDR) for h in hdr]]
     for r in rows:
-        res.append([r["name"], r["level"], (r["status"], S_GRN if r["status"] == "PASS" else S_RED), r["equal"]] + [r[k] for k in ("compared", "different", "null_new", "null_old", "only_old", "only_new")] + [(r["comment"], S_WRAP)])
-    res.append(["TOTAL (%d tables)" % n, "", "%d PASS / %d NOT MET%s" % (n_pass, n_notmet, (" / %d other" % (n_nc + n_err)) if (n_nc + n_err) else ""), "%d of %d tables" % (n_zero, n), t_cmp, t_dif, tot("null_new"), tot("null_old"), tot("only_old"), tot("only_new"), "%.2f%% of compared values are equal" % pct])
-    ov = [dict(name="Results", rows=res, widths=[20, 8, 14, 14, 16, 14, 16, 16, 16, 16, 110], freeze=1)]
+        res.append([r["name"], r["level"], (r["status"], S_GRN if r["status"] == "PASS" else S_RED), r["equal"], r["compared"], r["equal_n"], pct_of(r)] + [r[k] for k in ("different", "null_new", "null_old", "only_old", "only_new")] + [periods_text(r), dup_text(r), (r["comment"], S_WRAP)])
+    res.append(["TOTAL (%d tables)" % n, "", "%d PASS / %d NOT MET%s" % (n_pass, n_notmet, (" / %d other" % (n_nc + n_err)) if (n_nc + n_err) else ""), "%d of %d tables" % (n_zero, n), t_cmp, t_eq, "%.2f%%" % pct, t_dif, tot("null_new"), tot("null_old"), tot("only_old"), tot("only_new"), "%d table%s with a period on one side only" % (n_period_issue, "" if n_period_issue == 1 else "s"), dup_total_text(rows), "%.2f%% of the compared values are equal (a value empty on one side counts as not equal)" % pct])
+    ov = [dict(name="Results", rows=res, widths=[20, 8, 14, 14, 16, 16, 10, 14, 16, 16, 16, 16, 30, 24, 110], freeze=1)]
     ov.append(simple_sheet("How to read", [["Term", "Meaning"],
-        ["Status PASS", "0 different values AND nothing found on one side only AND no value empty on one side AND no KPI column on one side only."],
+        ["Status PASS", "0 different values AND nothing found on one side only AND no value empty on one side AND no KPI column on one side only AND no period on one side only AND no repeated row with conflicting values. This is checked from the numbers of the run, whatever the FAIL_ON_ settings of the run were."],
         ["Status NOT MET", "At least one of the above is not zero. The comment says which."],
-        ["All paired values equal?", "Yes = every value filled on both sides is equal within the tolerance. It does not cover objects or values found on one side only."],
-        ["Values compared", "Values filled on both sides, for objects found on both sides."],
+        ["All paired values equal?", "Yes = different values + values empty in NEW only + values empty in OLD only = 0, for the objects found on both sides. It does not cover objects found on one side only."],
+        ["Values compared", "Common objects x common KPI columns. It includes the values that are empty on one side."],
+        ["Values equal / % equal", "Values compared minus different values minus values empty on one side. % equal = values equal / values compared, so a value empty on one side counts as not equal."],
         ["Empty in NEW only / OLD only", "The object is on both sides; one side has a number and the other is empty."],
         ["Objects only in OLD / NEW", "An object (cell or node and period) found in one table but not the other."],
+        ["Periods", "How many of the 15-minute periods in the window exist on both sides, and how many exist in one table only (the Periods sheet of each table folder lists every period)."],
+        ["Repeated rows (conflicting)", "The same object and period appears more than once on one side. The larger value is used. 'Conflicting' = the repeated rows hold different values, so the larger value may hide a difference."],
         ["Tolerance", "absolute %s, relative %s (equal when abs(old-new) <= abs + rel*abs(old))" % (env.get("TOLERANCE_ABS", "?"), env.get("TOLERANCE_REL", "?"))],
         ["Period", period],
         ["Data as of", "Comparison finished %s (server time). Data that arrives later or a change in the NEW calculator can change the result." % run_time]], [30, 130]))
@@ -473,7 +562,7 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
     D.table(["Role", "Name", "Department", "Signature / email", "Date of approval"], [["Approver", "", "", "", ""], ["Reviewer", "", "", "", ""]], [3, 4, 3.5, 4, 3])
     D.h(1, "1. Executive Summary")
     D.h(2, "1.1 Test Phase Summary")
-    D.p("This report records the comparison of the pivot tables written by the NEW KPI calculator with the pivot tables written by the OLD (Java) calculator, for %d tables (%d cell tables, %d node tables). The aim is to show that the NEW calculator produces the same KPI values as the OLD one." % (n, sum(1 for r in rows if r["level"] == "Cell"), sum(1 for r in rows if r["level"] == "Node")))
+    D.p("This report records the comparison of the pivot tables written by the NEW KPI calculator with the pivot tables written by the OLD (Java) calculator, for %d tables (%d cell tables, %d node tables). The aim is to measure how closely the KPI values of the NEW calculator match those of the OLD calculator." % (n, sum(1 for r in rows if r["level"] == "Cell"), sum(1 for r in rows if r["level"] == "Node")))
     D.bullets(["Period tested: " + period + ".",
                "Approach: the OLD and NEW pivot tables are read (read-only), rows are paired by the key columns of each table, every KPI value is compared, and the differences are recorded.",
                "Tolerance: absolute %s, relative %s." % (env.get("TOLERANCE_ABS", "?"), env.get("TOLERANCE_REL", "?")),
@@ -487,15 +576,16 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
     if fingerprint_path and os.path.isfile(fingerprint_path):
         D.p("The NEW tables may change while they are being tested. The results workbook has a sheet 'NEW data tested' (row count, periods and last update of each NEW table in the tested window) that shows which NEW data was compared. If that data changes, the comparison has to be run again.")
     else:
-        D.p("The NEW tables may change while they are being tested. No fingerprint of the NEW data (row count, periods and last update per table) was recorded for this run, so this report does not prove that the NEW data stayed the same. If the NEW data changes, the comparison has to be run again.")
+        D.p("The NEW tables can change while they are being tested. This run did not record a fingerprint of the NEW data (row count, periods and last update per table), so the report states the data only as it was when the comparison finished. If the NEW data changes, run the comparison again.")
     D.h(2, "1.4 Compliance to Exit Criteria")
     met = "Met" if n_pass == n else "Not Met"
     D.table(["No.", "Exit criterion", "Compliance", "Comments"], [["1", "All NEW pivot values equal the OLD values for the tested period, for all %d tables" % n, met,
-        "%d of %d tables have all paired values equal. %s values compared, %s different (%.2f%% equal). %d tables are PASS, %d NOT MET%s." % (n_zero, n, fmt(t_cmp), fmt(t_dif), pct, n_pass, n_notmet, (", %d could not be compared or failed" % (n_nc + n_err)) if (n_nc + n_err) else "")]], [1.2, 6, 2.3, 7.5])
+        "%d of %d tables have all paired values equal. %s values compared: %s equal (%.2f%%), %s different, %s empty on one side only. %d tables are PASS, %d NOT MET%s." % (n_zero, n, fmt(t_cmp), fmt(t_eq), pct, fmt(t_dif), fmt(t_empty), n_pass, n_notmet, (", %d could not be compared or failed" % (n_nc + n_err)) if (n_nc + n_err) else "")]], [1.2, 6, 2.3, 7.5])
     D.h(2, "1.5 Conclusion & Recommendations")
-    c = ["%d tables compared; %s of %s values equal (%.2f%%)." % (n, fmt(t_cmp - t_dif), fmt(t_cmp), pct)]
-    if zero_names: c.append("%d tables have 0 different values among the values that paired: %s." % (len(zero_names), ", ".join(zero_names)))
+    c = ["%d tables compared; %s of %s values equal (%.2f%%). A value that is empty on one side counts as not equal: %s values are empty on one side only." % (n, fmt(t_eq), fmt(t_cmp), pct, fmt(t_empty))]
+    if zero_names: c.append("%d tables have 0 different values among the values filled on both sides: %s." % (len(zero_names), ", ".join(zero_names)))
     if diff_rows: c.append("%d tables have different values: %s." % (len(diff_rows), ", ".join("%s %s" % (r["name"], fmt(r["different"])) for r in diff_rows)))
+    if conflict_rows: c.append("%d tables have repeated rows with conflicting values: %s. The larger value is used for them, so 0 different values in these tables may hide differences (section 3.3.3)." % (len(conflict_rows), ", ".join("%s %s" % (r["name"], fmt(r["dup_conflict"])) for r in conflict_rows)))
     c += notes.get("conclusion", [])
     D.bullets(c)
     D.h(1, "2. Test Scope Summary")
@@ -507,7 +597,15 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
     D.bullets(notes.get("variations", ["None recorded for this run."]))
     D.h(1, "3. Test Results")
     D.h(2, "3.1 Test Execution Summary")
-    D.p("%d tables compared: %d PASS, %d NOT MET%s. Values compared %s, different %s, empty in NEW only %s, empty in OLD only %s, objects only in OLD %s, objects only in NEW %s." % (n, n_pass, n_notmet, (", %d NOT COMPARABLE, %d ERROR" % (n_nc, n_err)) if (n_nc + n_err) else "", fmt(t_cmp), fmt(t_dif), fmt(tot("null_new")), fmt(tot("null_old")), fmt(tot("only_old")), fmt(tot("only_new"))))
+    D.p("%d tables compared: %d PASS, %d NOT MET%s. Values compared %s, equal %s (%.2f%%), different %s, empty in NEW only %s, empty in OLD only %s, objects only in OLD %s, objects only in NEW %s." % (n, n_pass, n_notmet, (", %d NOT COMPARABLE, %d ERROR" % (n_nc, n_err)) if (n_nc + n_err) else "", fmt(t_cmp), fmt(t_eq), pct, fmt(t_dif), fmt(tot("null_new")), fmt(tot("null_old")), fmt(tot("only_old")), fmt(tot("only_new"))))
+    n_periods = max((r.get("p_total") or 0) for r in rows)
+    if any(r.get("p_total") is not None for r in rows):
+        if n_period_issue:
+            D.p("Periods: %d table%s %s a period that exists on one side only (see the Periods column of the results workbook)." % (n_period_issue, "" if n_period_issue == 1 else "s", "has" if n_period_issue == 1 else "have"))
+        else:
+            D.p("Periods: in every table all %d periods of the window exist on both sides." % n_periods)
+    if any(r.get("dup") is not None for r in rows):
+        D.p("Repeated rows on one side: %s. The larger value is used for a repeated row." % dup_total_text(rows))
     D.h(2, "3.2 Test Cases Executed (one line per table)")
     D.table(["Table", "Status", "Values compared", "Different", "Empty NEW only", "Empty OLD only", "Only OLD", "Only NEW"],
             [[r["name"], r["status"]] + [fmt(r[k]) if r[k] is not None else "n/a" for k in ("compared", "different", "null_new", "null_old", "only_old", "only_new")] for r in rows], [3.1, 2, 2.8, 1.8, 2.1, 2.1, 1.8, 1.8], size=8)
@@ -523,8 +621,16 @@ def build(report_dir, out_dir, title, author, notes_path, comments_path, fingerp
         D.table(["Table", "Result", "Detail"], [[r["name"], r["result"], r["detail"]] for r in nr], [3, 3, 11], size=8)
     else:
         D.p("None.")
+    D.h(3, "3.3.3 Repeated rows with conflicting values")
+    if conflict_rows:
+        D.table(["Table", "Repeated rows", "Conflicting", "Comment"],
+                [[r["name"], fmt(r["dup"]), fmt(r["dup_conflict"]), "The larger value was used; a difference between the repeated rows is not visible in the comparison. Listed in duplicate_keys.csv of the run folder."] for r in conflict_rows], [3, 2.5, 2.5, 9], size=8)
+    elif any(r.get("dup") and r.get("dup_conflict") is None for r in rows):
+        D.p("Conflicts between repeated rows were not measured in this run.")
+    else:
+        D.p("None.")
     D.h(2, "3.4 Defect Summary")
-    D.p("No defects are raised by this report. Each difference has to be analysed to decide whether it is a NEW calculator issue, an OLD calculator issue, a data issue or a difference in setup.")
+    D.p("No defects are raised by this report. Each difference is classified (NEW calculator, OLD calculator, data, or setup) once its cause is confirmed with the owners of the calculators. Causes that are confirmed are listed in sections 4 and 5; the others are marked 'not yet confirmed'.")
     D.h(1, "4. Open Issues & Risks")
     D.h(2, "4.1 Issues and open items")
     D.bullets(notes.get("open items", ["None recorded for this run."]))

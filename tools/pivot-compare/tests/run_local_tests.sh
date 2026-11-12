@@ -209,7 +209,7 @@ printf 'name,old_table,new_table,key_cols,info_cols
 first,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,CELL_NAME
 second,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,
 ' > "$W/pairs2.csv"
-variant S MODE=list "PAIRS_FILE=$W/pairs2.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes FINAL_REPORT=yes "FINAL_REPORT_DIR=$W/final_S" 'FINAL_REPORT_AUTHOR=Test Person'
+variant S MODE=list "PAIRS_FILE=$W/pairs2.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes FINAL_REPORT=yes "FINAL_REPORT_DIR=$W/final_S" 'FINAL_REPORT_AUTHOR="Test Person"'
 code=$(run S); R=$W/report_S; F=$W/final_S
 check "exit code is still the comparison result (1 = DIFFERENT)" 1 "$code"
 check "Word report exists" 1 "$([ -s "$F/Test Summary Report - NS Pivot Comparison.docx" ] && echo 1 || echo 0)"
@@ -233,15 +233,78 @@ import sys, zipfile
 z = zipfile.ZipFile(sys.argv[1] + '/NS Pivot Comparison - Results.xlsx')
 print(1 if 'NOT MET' in z.read('xl/worksheets/sheet1.xml').decode() else 0)
 " "$F")"
+check "the Results sheet shows % equal with the empty value counted as not equal (7 of 9 = 77.78%)" 1 "$("$PY" -I -c "
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1] + '/NS Pivot Comparison - Results.xlsx')
+print(1 if '77.78%' in z.read('xl/worksheets/sheet1.xml').decode() else 0)
+" "$F")"
 # the same run again: the output folder exists, nothing is overwritten, and the exit code is unchanged
 code=$(run S)
 check "second run: exit code unchanged (1)" 1 "$code"
 check "second run: says the folder already exists" 1 "$(grep -c 'already exists' "$W/S.out")"
 # a bad report setting only stops the report
-variant S2 MODE=list "PAIRS_FILE=$W/pairs2.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes FINAL_REPORT=yes "FINAL_REPORT_DIR=$W/final_S2" 'FINAL_REPORT_TITLE=bad;title'
+variant S2 MODE=list "PAIRS_FILE=$W/pairs2.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes FINAL_REPORT=yes "FINAL_REPORT_DIR=$W/final_S2" 'FINAL_REPORT_TITLE="bad;title"'
 code=$(run S2)
 check "bad FINAL_REPORT_TITLE: exit code unchanged (1)" 1 "$code"
 check "bad FINAL_REPORT_TITLE: no report folder" 0 "$([ -d "$W/final_S2" ] && echo 1 || echo 0)"
+fi
+
+echo "T. periods, repeated rows (FAIL_ON_DUPLICATES) and the PASS rule of the report"
+"$DUCKDB" "$W/t_old.duckdb" < tests/make_fake_dups.sql >/dev/null || { echo "could not build the fake duplicate data" >&2; exit 2; }
+"$DUCKDB" "$W/t_new.duckdb" < tests/make_fake_dups_new.sql >/dev/null || { echo "could not build the fake duplicate NEW data" >&2; exit 2; }
+TOLD='OLD_DB_FILE=tests/work/t_old.duckdb'; TNEW='NEW_DB_FILE=tests/work/t_new.duckdb'
+# T1: the window holds 3 periods: 09:00 on both sides, 09:15 only in OLD, 09:30 only in NEW
+variant T1 "$TOLD" "$TNEW" OLD_TABLE=t_old_per NEW_TABLE=t_new 'PERIOD_TO="2025-12-19 09:45:00+00"'
+code=$(run T1); R=$W/report_T1
+check "T1 exit code (1: objects of two periods are on one side only)" 1 "$code"
+check "T1 periods in total" 3 "$(metric $R periods_total)"
+check "T1 periods on both sides" 1 "$(metric $R periods_on_both_sides)"
+check "T1 periods only in OLD" 1 "$(metric $R periods_only_old)"
+check "T1 periods only in NEW" 1 "$(metric $R periods_only_new)"
+check "T1 period_summary.csv has one line per period" 3 "$(rows $R/period_summary.csv)"
+check "T1 the 09:15 period is flagged OLD only" "2025-12-19 09:15,OLD only" \
+  "$("$DUCKDB" -csv -noheader -c "SELECT period_utc, period_present FROM read_csv('$R/period_summary.csv', types = {'period_utc': 'VARCHAR'}) WHERE period_present = 'OLD only'")"
+check "T1 verdict line carries the period coverage" 1 "$(grep -c 'periods on both sides=1 only old=1 only new=1' "$R/verdict.txt")"
+# T2: a repeated row with conflicting values; max() makes the pair equal, so only the conflict check can show it
+variant T2 "$TOLD" "$TNEW" OLD_TABLE=t_old_conf NEW_TABLE=t_new
+code=$(run T2); R=$W/report_T2
+check "T2 values different (max() hides the conflict)" 0 "$(metric $R values_different)"
+check "T2 conflicting repeated rows" 1 "$(metric $R conflicting_duplicates)"
+check "T2 repeated rows in total (object + K_1 + K_2)" 3 "$(metric $R duplicate_entries)"
+check "T2 default FAIL_ON_DUPLICATES=conflicting: exit code 1 (DIFFERENT)" 1 "$code"
+check "T2 duplicate_keys.csv names the conflicting KPI with min and max" "K_1,yes,10.0,12.0" \
+  "$("$DUCKDB" -csv -noheader -c "SELECT kpi, conflicting, min_value, max_value FROM read_csv('$R/duplicate_keys.csv', types = {'conflicting': 'VARCHAR'}) WHERE conflicting = 'yes'")"
+variant T3 "$TOLD" "$TNEW" OLD_TABLE=t_old_conf NEW_TABLE=t_new FAIL_ON_DUPLICATES=no
+code=$(run T3)
+check "T3 FAIL_ON_DUPLICATES=no: exit code 0 (the repeat is only listed)" 0 "$code"
+# T4: identical repeated rows are harmless by default, and fail the verdict with FAIL_ON_DUPLICATES=yes
+variant T4 "$TOLD" "$TNEW" OLD_TABLE=t_old_same NEW_TABLE=t_new
+code=$(run T4); R=$W/report_T4
+check "T4 identical repeat: no conflicting rows" 0 "$(metric $R conflicting_duplicates)"
+check "T4 identical repeat: exit code 0 by default" 0 "$code"
+variant T5 "$TOLD" "$TNEW" OLD_TABLE=t_old_same NEW_TABLE=t_new FAIL_ON_DUPLICATES=yes
+code=$(run T5)
+check "T5 FAIL_ON_DUPLICATES=yes: exit code 1 for any repeat" 1 "$code"
+variant T6 "$TOLD" "$TNEW" OLD_TABLE=t_old_same NEW_TABLE=t_new FAIL_ON_DUPLICATES=maybe
+code=$(run T6)
+check "T6 a wrong FAIL_ON_DUPLICATES value is refused (exit 2)" 2 "$code"
+# T7: the report decides PASS from the numbers, not from the run's verdict. 'extra' is IDENTICAL for the run
+# (FAIL_ON_KPI_COLUMNS_ONE_SIDE=no) but has a KPI column only in OLD, so the report must say NOT MET; 'same' is PASS.
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then echo "  T7 skipped (python not found)"; else
+printf 'name,old_table,new_table,key_cols,info_cols
+same,t_old_same,t_new,SITE_ID;CELL_ID,
+extra,t_old_extra,t_new,SITE_ID;CELL_ID,
+' > "$W/pairs_t.csv"
+variant T7 "$TOLD" "$TNEW" MODE=list "PAIRS_FILE=$W/pairs_t.csv" FAIL_ON_KPI_COLUMNS_ONE_SIDE=no FINAL_REPORT=yes "FINAL_REPORT_DIR=$W/final_T7"
+code=$(run T7); R=$W/report_T7; F=$W/final_T7
+check "T7 exit code 0 (both tables are IDENTICAL for the run)" 0 "$code"
+check "T7 both tables are IDENTICAL in pairs_summary.csv" 2 "$("$DUCKDB" -csv -noheader -c "SELECT count(*) FROM read_csv('$R/pairs_summary.csv') WHERE result = 'IDENTICAL'")"
+check "T7 the report says 1 PASS / 1 NOT MET (the KPI column only in OLD is not hidden)" 1 "$("$PY" -I -c "
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1] + '/NS Pivot Comparison - Results.xlsx')
+print(1 if '1 PASS / 1 NOT MET' in z.read('xl/worksheets/sheet1.xml').decode() else 0)
+" "$F")"
 fi
 
 echo

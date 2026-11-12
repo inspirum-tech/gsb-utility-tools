@@ -15,7 +15,7 @@ CREATE OR REPLACE TEMP TABLE ${SIDE}_cols AS
 SELECT DISTINCT __kpi AS kpi FROM ${SIDE}_src WHERE regexp_matches(__kpi, '${SIDE_KPI_REGEX}');
 
 CREATE OR REPLACE TEMP TABLE ${SIDE}_long AS
-SELECT __p AS p_utc, __k AS k, __kpi AS kpi, max(__v) AS val, count(*) AS n
+SELECT __p AS p_utc, __k AS k, __kpi AS kpi, max(__v) AS val, min(__v) AS vmin, count(*) AS n
 FROM ${SIDE}_src
 WHERE __v IS NOT NULL AND regexp_matches(__kpi, '${SIDE_KPI_REGEX}')
 GROUP BY 1, 2, 3;

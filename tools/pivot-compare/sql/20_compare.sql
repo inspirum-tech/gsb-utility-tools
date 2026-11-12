@@ -26,15 +26,20 @@ SELECT 'new', p_utc, k, n_rows FROM new_keys n
   WHERE NOT EXISTS (SELECT 1 FROM old_keys o WHERE o.p_utc = n.p_utc AND o.k = n.k);
 
 -- A repeated key on one side (more than one source row for the same object and period, or for the same KPI):
--- the values are reduced with max() on both sides; the repeats are listed so nobody is surprised.
+-- the values are reduced with max() on both sides, and the repeats are listed so nobody is surprised.
+-- A repeat is CONFLICTING when its values differ (min and max apart by more than the tolerance): max() then picks one of
+-- them, which can hide a real difference. FAIL_ON_DUPLICATES (conflicting | yes | no) decides if that changes the verdict.
 CREATE OR REPLACE TEMP TABLE duplicates AS
-SELECT 'old' AS side, p_utc, k, '*' AS kpi, n_rows AS n FROM old_keys WHERE n_rows > ${DUP_THRESHOLD_OLD}
+SELECT 'old' AS side, p_utc, k, '*' AS kpi, n_rows AS n, CAST(NULL AS DOUBLE) AS min_value, CAST(NULL AS DOUBLE) AS max_value, false AS conflicting
+FROM old_keys WHERE n_rows > ${DUP_THRESHOLD_OLD}
 UNION ALL
-SELECT 'new', p_utc, k, '*', n_rows FROM new_keys WHERE n_rows > ${DUP_THRESHOLD_NEW}
+SELECT 'new', p_utc, k, '*', n_rows, CAST(NULL AS DOUBLE), CAST(NULL AS DOUBLE), false FROM new_keys WHERE n_rows > ${DUP_THRESHOLD_NEW}
 UNION ALL
-SELECT 'old', p_utc, k, kpi, n FROM old_long WHERE n > 1
+SELECT 'old', p_utc, k, kpi, n, vmin, val,
+       (val <> vmin AND abs(val - vmin) > ${TOLERANCE_ABS} + ${TOLERANCE_REL} * abs(vmin) + ${FLOAT_SLACK}) FROM old_long WHERE n > 1
 UNION ALL
-SELECT 'new', p_utc, k, kpi, n FROM new_long WHERE n > 1;
+SELECT 'new', p_utc, k, kpi, n, vmin, val,
+       (val <> vmin AND abs(val - vmin) > ${TOLERANCE_ABS} + ${TOLERANCE_REL} * abs(vmin) + ${FLOAT_SLACK}) FROM new_long WHERE n > 1;
 
 -- One row per (object, period, KPI) that has a value on at least one side, for objects and KPIs on both sides.
 CREATE OR REPLACE TEMP TABLE cmp_raw AS
@@ -87,6 +92,34 @@ LEFT JOIN (
   FROM cmp GROUP BY kpi
 ) s ON s.kpi = cc.kpi;
 
+-- Per period (UTC): which side holds the period, the objects on each side and in both, and the value counts.
+-- A period that exists on one side only shows as 'OLD only' / 'NEW only' (all its objects are then one-sided).
+CREATE OR REPLACE TEMP TABLE period_summary AS
+WITH pp AS (SELECT p_utc FROM old_keys UNION SELECT p_utc FROM new_keys),
+     po AS (SELECT p_utc, count(*) AS n FROM old_keys GROUP BY 1),
+     pn AS (SELECT p_utc, count(*) AS n FROM new_keys GROUP BY 1),
+     pc AS (SELECT p_utc, count(*) AS n FROM common_keys GROUP BY 1),
+     pv AS (SELECT p_utc,
+                   count(*) FILTER (WHERE kind = 'DIFF') AS n_diff,
+                   count(*) FILTER (WHERE kind = 'NULL_OLD_ONLY') AS n_null_old,
+                   count(*) FILTER (WHERE kind = 'NULL_NEW_ONLY') AS n_null_new
+            FROM cmp GROUP BY 1),
+     base AS (SELECT pp.p_utc,
+                     coalesce(po.n, 0) AS old_objects, coalesce(pn.n, 0) AS new_objects, coalesce(pc.n, 0) AS common_objects,
+                     coalesce(pc.n, 0) * (SELECT count(*) FROM common_cols) AS values_compared,
+                     coalesce(pv.n_diff, 0) AS values_different,
+                     coalesce(pv.n_null_old, 0) AS values_null_old_only,
+                     coalesce(pv.n_null_new, 0) AS values_null_new_only
+              FROM pp LEFT JOIN po ON po.p_utc = pp.p_utc LEFT JOIN pn ON pn.p_utc = pp.p_utc
+                      LEFT JOIN pc ON pc.p_utc = pp.p_utc LEFT JOIN pv ON pv.p_utc = pp.p_utc)
+SELECT p_utc, old_objects, new_objects, common_objects,
+       old_objects - common_objects AS only_old_objects, new_objects - common_objects AS only_new_objects,
+       values_compared,
+       values_compared - values_different - values_null_old_only - values_null_new_only AS values_equal,
+       values_different, values_null_old_only, values_null_new_only,
+       CASE WHEN old_objects > 0 AND new_objects > 0 THEN 'both' WHEN old_objects > 0 THEN 'OLD only' ELSE 'NEW only' END AS period_present
+FROM base;
+
 CREATE OR REPLACE TEMP TABLE totals AS
 SELECT
   (SELECT count(*) FROM old_keys) AS old_objects,
@@ -106,7 +139,12 @@ SELECT
   (SELECT coalesce(sum(different), 0) FROM kpi_summary) AS values_different,
   (SELECT coalesce(sum(null_old_only), 0) FROM kpi_summary) AS values_null_old_only,
   (SELECT coalesce(sum(null_new_only), 0) FROM kpi_summary) AS values_null_new_only,
-  (SELECT count(*) FROM duplicates) AS duplicate_entries;
+  (SELECT count(*) FROM period_summary) AS periods_total,
+  (SELECT count(*) FROM period_summary WHERE period_present = 'both') AS periods_on_both_sides,
+  (SELECT count(*) FROM period_summary WHERE period_present = 'OLD only') AS periods_only_old,
+  (SELECT count(*) FROM period_summary WHERE period_present = 'NEW only') AS periods_only_new,
+  (SELECT count(*) FROM duplicates) AS duplicate_entries,
+  (SELECT count(*) FROM duplicates WHERE conflicting) AS conflicting_duplicates;
 
 CREATE OR REPLACE TEMP TABLE verdict AS
 SELECT
@@ -116,6 +154,8 @@ SELECT
       OR ('${FAIL_ON_OBJECTS_ONE_SIDE}' = 'yes' AND only_old_objects + only_new_objects > 0)
       OR ('${FAIL_ON_KPI_COLUMNS_ONE_SIDE}' = 'yes' AND only_old_kpi_columns + only_new_kpi_columns > 0)
       OR ('${FAIL_ON_NULL_ONE_SIDE}' = 'yes' AND values_null_old_only + values_null_new_only > 0)
+      OR ('${FAIL_ON_DUPLICATES}' = 'yes' AND duplicate_entries > 0)
+      OR ('${FAIL_ON_DUPLICATES}' IN ('yes', 'conflicting') AND conflicting_duplicates > 0)
       THEN 'DIFFERENT'
     ELSE 'IDENTICAL'
   END AS verdict,

@@ -1,0 +1,7 @@
+-- Fake NEW table for group T (see make_fake_dups.sql): periods 09:00 UTC (objects (1,1) and (2,1)) and 09:30 UTC (object (1,1)).
+CREATE OR REPLACE TABLE t_new (
+  PERIOD_START_TIME TIMESTAMPTZ, SITE_ID BIGINT, CELL_ID BIGINT, KPI_ID BIGINT, KPI_VALUE DOUBLE, APPLICATION VARCHAR);
+INSERT INTO t_new VALUES
+  ('2025-12-19 09:00:00+00', 1, 1, 1, 12.0, 'APP_TEST'), ('2025-12-19 09:00:00+00', 1, 1, 2, 5.0, 'APP_TEST'),
+  ('2025-12-19 09:00:00+00', 2, 1, 1, 7.0, 'APP_TEST'),  ('2025-12-19 09:00:00+00', 2, 1, 2, 8.0, 'APP_TEST'),
+  ('2025-12-19 09:30:00+00', 1, 1, 1, 12.0, 'APP_TEST'), ('2025-12-19 09:30:00+00', 1, 1, 2, 5.0, 'APP_TEST');

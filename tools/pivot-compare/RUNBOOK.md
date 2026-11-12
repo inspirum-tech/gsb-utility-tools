@@ -86,8 +86,8 @@ Open `config_ns_all_uat.env` and check these lines. Everything not listed here s
 | `REPORT_DIR` | A new folder name for this run, for example `report_uat_20261201`. | A new run writes into this folder. Use a new name for every run. |
 | `FINAL_REPORT_TITLE` | A title for the report, for example `"NS Pivot Comparison - UAT"`. | Printed on the Word report. |
 | `FINAL_REPORT_AUTHOR` | Your name. | Printed on the Word report. |
-| `FINAL_REPORT_NOTES_FILE` | **Leave empty** (`FINAL_REPORT_NOTES_FILE=`). | The file named on dev holds text about the dev data. It must not go into a UAT report. |
-| `FINAL_REPORT_COMMENTS_FILE` | **Leave empty** (`FINAL_REPORT_COMMENTS_FILE=`). | Same reason. |
+| `FINAL_REPORT_NOTES_FILE` | **Leave empty** (it is empty in `config_ns_all.env`). | A notes file holds text about the dev data. It must not go into a UAT report. Use `config_ns_all.env`, not `config_ns_all_dev.env`. |
+| `FINAL_REPORT_COMMENTS_FILE` | **Leave empty** (it is empty in `config_ns_all.env`). | Same reason. |
 | `PAIRS_FILE` | `pairs_ns_name.csv`, or your own copy (see below). | The list of tables to compare. |
 
 Keep these as they are, unless you were told otherwise: `MODE=list`, `OLD_SOURCE=postgres`, `OLD_DSN_ENV=KPI_ENGINE_PG_DSN`, `NEW_SOURCE=attached`, `OLD_PERIOD_KIND=local`, `OLD_PERIOD_TZ=Australia/Sydney`, `NEW_PERIOD_KIND=tz`, the tolerance lines, `FINAL_REPORT=yes`, `CM_COMPARE=no`.
@@ -162,7 +162,7 @@ pairs: 18   identical: x   different: y   not comparable: z   errors: e
 | `<REPORT_DIR>_FINAL_OUTPUT_RESULT.zip` | The same folder as one zip file. **Send this file** |
 | `tmp/` | DuckDB temporary files. Safe to delete when no run is active |
 
-Pass/not-met wording in the report: a table is `PASS` only when nothing differs, nothing exists on one side only and nothing is empty; otherwise it says `NOT MET` with the numbers. The report states the time the comparison finished: it describes the data as it was at that time.
+Pass/not-met wording in the report: a table is `PASS` only when nothing differs, nothing exists on one side only, nothing is empty on one side, no period exists on one side only and no repeated row has conflicting values; otherwise it says `NOT MET` with the numbers. "% equal" counts a value that is empty on one side as not equal. Each table folder also has `period_summary.csv` (every 15-minute period and whether it is on both sides) in the raw results and a `Periods` sheet in its workbook. The report states the time the comparison finished: it describes the data as it was at that time.
 
 If the final output was not created (for example no `python3`), the log says so and the raw results in `<REPORT_DIR>/` are still complete. The exit code is not changed by the final output.
 

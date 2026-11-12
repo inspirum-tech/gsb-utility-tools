@@ -40,6 +40,10 @@ need_ts PERIOD_FROM; need_ts PERIOD_TO
 for v in TOLERANCE_ABS TOLERANCE_REL FLOAT_SLACK; do need_number "$v"; done
 need_signed SPECIAL_DEFAULT
 for v in SPECIAL_AS_DEFAULT NULL_AS_DEFAULT FAIL_ON_OBJECTS_ONE_SIDE FAIL_ON_KPI_COLUMNS_ONE_SIDE FAIL_ON_NULL_ONE_SIDE; do need_yesno "$v"; done
+# FAIL_ON_DUPLICATES: a repeated row on one side is reduced with max(), which can hide a real difference.
+#   conflicting (default) = the verdict is DIFFERENT when repeated rows hold different values; yes = DIFFERENT for any repeated row; no = never
+FAIL_ON_DUPLICATES="${FAIL_ON_DUPLICATES:-conflicting}"
+case "$FAIL_ON_DUPLICATES" in no|conflicting|yes) ;; *) die "FAIL_ON_DUPLICATES must be no, conflicting or yes (got '$FAIL_ON_DUPLICATES')";; esac
 need_regex KPI_REGEX
 opt_path KPI_LIST_FILE; opt_path KPI_MAP_FILE; need_path REPORT_DIR; opt_path TEMP_DIR; need_path ENV_FILE
 [[ "$MAX_DIFF_ROWS" =~ ^[0-9]+$ ]] || die "MAX_DIFF_ROWS must be a whole number"
