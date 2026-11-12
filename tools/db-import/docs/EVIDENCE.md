@@ -14,7 +14,8 @@ Dev server (for the later tests): bash 5.1.8, psql 18.1, DuckDB v1.5.5 (Variegat
 | Repeat run, failure rollback, NULL / empty / special characters, window edge, stop / append, FULL_COPY_TABLES, SOURCE=TARGET mapping | ✅ 44 / 44 checks pass on dev (section 5) |
 | `--check` / `--dry-run` change nothing | ✅ confirmed on dev, section 4 |
 | DuckLake -> Postgres on real data (40921 rows, Sydney time zone, replace, backup, dry-run rollback, sums equal to source) | ✅ confirmed on dev, section 6 |
-| DuckDB file source / target, DuckLake as target, parquet source | ⏳ untested (code written; same code path as above except the ATTACH / read_parquet line) |
+| DuckDB file -> DuckDB file on real data (40921 rows, Sydney time zone, replace, backup, dry-run rollback, row for row equal) | ✅ confirmed on dev, section 7 |
+| DuckLake as target, parquet source | ⏳ untested (code written; same code path as above except the ATTACH / read_parquet line) |
 | `ON_ERROR=continue`, the interactive prod confirmation | ⏳ untested |
 | Offline bundle: built on dev, its self-check loads every extension with an empty HOME and auto-download off; db-import then ran from `bundle/` only | ✅ confirmed on dev (section 6). Not tested: a server that really has no network, and a copy of the bundle on another machine |
 | Behaviour on uat / prod | ⏳ untestable by us (no access); same software as dev per the user |
@@ -134,6 +135,25 @@ The first imported time is `2026-10-25 00:00:00` (Sydney local), not `2026-10-24
 Verdict ✅. Other finding: NEW (40200 + 721 rows) and OLD (40221 + 40224 ...) hold different data for the same day: it is the new calculator's output, not a tool problem.
 Problem met on the way (not a tool bug): the report folder `/tmp/dbimport_reports` was created by the `postgres` user in an earlier run, so a run as `osssupport` could not write there; a separate `REPORT_DIR` fixed it.
 
-## 7. Still to run
+## 7. Dev server, DuckDB file -> DuckDB file, real data (2026-11-12)
 
-Not tested on a database: DuckDB file as source or target, DuckLake as a target, a parquet source, `ON_ERROR=continue`, the interactive prod confirmation, and a server that really has no network.
+Environment: dev, DuckDB v1.5.5 from `bundle/`, run as osssupport, `OFFLINE=yes`. This case needs no extension at all (`extensions needed:` is empty).
+Source: `/tmp/dbimport_duck_test/source.duckdb`, a copy of the real DuckLake table `KPI_NS_QRLY_NODE_CEM_ERS_NEW_P` for 2026-10-25 (40921 rows; read-only copy, DuckLake untouched).
+Target: `/tmp/dbimport_duck_test/target.duckdb`, same structure, 3 marked rows: 2 "old in window" (00:15, 01:15), 1 "outside window" (05:00), all `UPDATE_TIMESTAMP = 2000-01-01`.
+Config: `configs/demo_dd.env`, `TIMEZONE=Australia/Sydney`, period `2026-10-25` up to `2026-10-25 02:00`.
+
+| Step | Output (verbatim, shortened) | Verdict |
+|---|---|---|
+| `--check` | `... window 40921 2 KPI_NS_QRLY_NODE_CEM_ERS_NEW_P_bak_20261112_235021` and `check only: nothing was changed` | ✅ |
+| `--dry-run` | `DRY-RUN OK (rolled back): target rows in the period 2 -> 40921 (source 40921), backup rows 2, 0s` | ✅ |
+| after the dry run (read-only attach) | `rows 3, first 2026-10-25 00:15:00+11, last 2026-10-25 05:00:00+11`, `backup_tables_left 0` | ✅ rollback left nothing behind |
+| real run | `OK: target rows in the period 2 -> 40921 (source 40921), backup rows 2, 0s` and `finished: all tables OK` | ✅ |
+
+AFTER: `in_source_not_target 0`, `in_target_not_source 0` (EXCEPT both ways over the window);
+`rows 40922 | first 2026-10-25 00:00:00+11 | last 2026-10-25 05:00:00+11 | outside_row_kept 1 | old_rows_left 0`;
+backup table `KPI_NS_QRLY_NODE_CEM_ERS_NEW_P_bak_20261112_235141` with 2 rows.
+Verdict ✅: old rows replaced, the outside row survived, all 40921 rows equal the source, the replaced rows are in the backup, a dry run changes nothing.
+
+## 8. Still to run
+
+Not tested on a database: DuckLake as a target, a parquet source, `ON_ERROR=continue`, the interactive prod confirmation, and a server that really has no network.

@@ -5,7 +5,8 @@ database. Source and target can be any environment (dev, uat, prod) and Postgres
 every time; only the config changes. Works on servers with **no internet**. Standalone: it shares no file
 with the other tools in this repository.
 
-Status and decisions: [PLAN.md](PLAN.md), open items: [parking-lot.md](parking-lot.md).
+**To run it on uat / prod follow [RUNBOOK.md](RUNBOOK.md)** (step by step, no other help needed).
+Status and decisions: [PLAN.md](PLAN.md), open items: [parking-lot.md](parking-lot.md), what was tested: [docs/EVIDENCE.md](docs/EVIDENCE.md).
 
 ## Quick start
 

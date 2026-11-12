@@ -9,9 +9,9 @@ Status: **Plan signed off by the user (2026-11-12). Code written on branch `feat
 | 1 Sign-off | ✅ done 2026-11-12 (all parking-lot items answered) |
 | 2 Postgres -> Postgres path + config + report | ✅ done, tested on dev (docs/EVIDENCE.md sections 4 and 5) |
 | 3 Test on dev (scratch schema, before/after evidence) | ✅ done: 44 / 44 scratch checks and a real-data run (80445 rows) |
-| 4 DuckDB paths | ✅ DuckLake -> Postgres tested on real data (40921 rows); DuckDB file, DuckLake target, parquet not yet run |
+| 4 DuckDB paths | ✅ DuckLake -> Postgres and DuckDB file -> DuckDB file tested on real data (40921 rows); DuckLake target and parquet source not yet run |
 | 5 `prepare-bundle.sh` + offline test | ✅ bundle built on dev and used by the run; ⏳ not tested on a machine with no network |
-| 6 README + RUNBOOK, UAT/prod checklist | 🟨 README done; RUNBOOK still to write |
+| 6 README + RUNBOOK, UAT/prod checklist | ✅ README and RUNBOOK.md written (2026-11-12); the runbook has not been followed by someone else yet |
 
 ### 2026-11-12 ✅ code written
 - Branch `feature/db-import` created from the current HEAD (not from `main`, so the pivot-compare files stay in the working tree). Nothing committed.
