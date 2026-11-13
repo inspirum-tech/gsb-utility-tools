@@ -19,3 +19,9 @@ INSERT INTO t_old_per VALUES
 CREATE OR REPLACE TABLE t_old_extra (PERIOD_START_TIME TIMESTAMP, SITE_ID INTEGER, CELL_ID INTEGER, K_1 DECIMAL(30,10), K_2 DECIMAL(30,10), K_9 DECIMAL(30,10));
 INSERT INTO t_old_extra VALUES
   ('2025-12-19 20:00:00', 1, 1, 12, 5, 1), ('2025-12-19 20:00:00', 2, 1, 7, 8, 1);
+
+-- t_old_nb: object (2,1) has no value for K_2 on the OLD side; the NEW side (t_new_b) has no K_2 row for it either,
+-- so that pair is empty on both sides (counted as equal, but reported separately).
+CREATE OR REPLACE TABLE t_old_nb (PERIOD_START_TIME TIMESTAMP, SITE_ID INTEGER, CELL_ID INTEGER, K_1 DECIMAL(30,10), K_2 DECIMAL(30,10));
+INSERT INTO t_old_nb VALUES
+  ('2025-12-19 20:00:00', 1, 1, 12, 5), ('2025-12-19 20:00:00', 2, 1, 7, NULL);

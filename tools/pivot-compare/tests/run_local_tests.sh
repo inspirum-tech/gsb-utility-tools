@@ -44,6 +44,7 @@ check "values equal (rounding and NaN rule included)" 7 "$(metric $R values_equa
 check "values different" 1 "$(metric $R values_different)"
 check "NULL in old only" 1 "$(metric $R values_null_old_only)"
 check "NULL in new only" 0 "$(metric $R values_null_new_only)"
+check "values empty on both sides" 0 "$(metric $R values_empty_both)"
 check "rows in differences.csv" 2 "$(rows $R/differences.csv)"
 check "rows in objects_one_side.csv" 2 "$(rows $R/objects_one_side.csv)"
 check "rows in kpi_columns_one_side.csv" 2 "$(rows $R/kpi_columns_one_side.csv)"
@@ -288,6 +289,14 @@ check "T5 FAIL_ON_DUPLICATES=yes: exit code 1 for any repeat" 1 "$code"
 variant T6 "$TOLD" "$TNEW" OLD_TABLE=t_old_same NEW_TABLE=t_new FAIL_ON_DUPLICATES=maybe
 code=$(run T6)
 check "T6 a wrong FAIL_ON_DUPLICATES value is refused (exit 2)" 2 "$code"
+# T8: a value empty on both sides counts as equal and is reported separately
+variant T8 "$TOLD" "$TNEW" OLD_TABLE=t_old_nb NEW_TABLE=t_new_b
+code=$(run T8); R=$W/report_T8
+check "T8 values compared (2 objects x 2 KPIs)" 4 "$(metric $R values_compared)"
+check "T8 values empty on both sides" 1 "$(metric $R values_empty_both)"
+check "T8 values equal (the empty pair counts as equal)" 4 "$(metric $R values_equal)"
+check "T8 nothing different or empty on one side: exit code 0" 0 "$code"
+check "T8 kpi_summary.csv has the empty_both column for K_2" "K_2,1" "$("$DUCKDB" -csv -noheader -c "SELECT kpi, empty_both FROM read_csv('$R/kpi_summary.csv') WHERE kpi = 'K_2'")"
 # T7: the report decides PASS from the numbers, not from the run's verdict. 'extra' is IDENTICAL for the run
 # (FAIL_ON_KPI_COLUMNS_ONE_SIDE=no) but has a KPI column only in OLD, so the report must say NOT MET; 'same' is PASS.
 PY="$(command -v python3 || command -v python || true)"

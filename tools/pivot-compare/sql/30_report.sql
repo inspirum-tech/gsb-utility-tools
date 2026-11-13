@@ -29,7 +29,7 @@ COPY (
 ) TO '${REPORT_DIR}/period_summary.csv' (HEADER, DELIMITER ',');
 
 COPY (
-  SELECT kpi, compared, equal_count AS equal, different, null_old_only, null_new_only, max_abs_diff
+  SELECT kpi, compared, equal_count AS equal, different, null_old_only, null_new_only, max_abs_diff, null_both AS empty_both
   FROM kpi_summary ORDER BY different DESC, null_old_only + null_new_only DESC, kpi
 ) TO '${REPORT_DIR}/kpi_summary.csv' (HEADER, DELIMITER ',');
 

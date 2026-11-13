@@ -81,10 +81,13 @@ SELECT cc.kpi,
        coalesce(s.n_diff, 0) AS different,
        coalesce(s.n_null_old, 0) AS null_old_only,
        coalesce(s.n_null_new, 0) AS null_new_only,
-       s.max_abs_diff
+       s.max_abs_diff,
+       -- a pair that is empty on both sides has no row in cmp (empty values are not stored); it counts as equal above
+       (SELECT count(*) FROM common_keys) - coalesce(s.n_rows, 0) AS null_both
 FROM common_cols cc
 LEFT JOIN (
   SELECT kpi,
+         count(*) AS n_rows,
          count(*) FILTER (WHERE kind = 'DIFF') AS n_diff,
          count(*) FILTER (WHERE kind = 'NULL_OLD_ONLY') AS n_null_old,
          count(*) FILTER (WHERE kind = 'NULL_NEW_ONLY') AS n_null_new,
@@ -139,6 +142,7 @@ SELECT
   (SELECT coalesce(sum(different), 0) FROM kpi_summary) AS values_different,
   (SELECT coalesce(sum(null_old_only), 0) FROM kpi_summary) AS values_null_old_only,
   (SELECT coalesce(sum(null_new_only), 0) FROM kpi_summary) AS values_null_new_only,
+  (SELECT coalesce(sum(null_both), 0) FROM kpi_summary) AS values_empty_both,
   (SELECT count(*) FROM period_summary) AS periods_total,
   (SELECT count(*) FROM period_summary WHERE period_present = 'both') AS periods_on_both_sides,
   (SELECT count(*) FROM period_summary WHERE period_present = 'OLD only') AS periods_only_old,
