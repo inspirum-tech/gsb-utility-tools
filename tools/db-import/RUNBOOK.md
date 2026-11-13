@@ -29,6 +29,8 @@ You run it in three steps, always in this order:
 
 Check: `bash --version | head -1` and `psql --version`. No internet is needed, ever.
 The machine must be able to reach both databases (host and port). It can be a machine other than the database servers.
+**DuckLake needs more than the connection:** the metadata Postgres is reached by host and port (a tunnel is fine), but DuckDB reads and writes the DuckLake parquet files itself, straight from the data folder (`*_DUCKLAKE_DATA_PATH`).
+So the machine that runs the tool must also be able to open the source data folder (read) and the target data folder (write). A tunnel does not carry those files. See section 3.2.
 
 Permissions of the database user:
 
@@ -60,6 +62,9 @@ If the user cannot create the backup tables, ask your DBA for the right, or set 
    ```
    (Or simply copy the whole `db-import` folder from dev with `bundle/` in it.) The tool checks the bundle itself on every run (checksums and DuckDB version) and stops if it is damaged or incomplete.
    For Postgres -> Postgres no bundle is needed.
+   **Never run `prepare-bundle.sh` on UAT or prod:** it downloads the extensions, so it needs internet. Run it once on dev (or any machine with internet and the same DuckDB version), then copy `bundle/` over.
+   The extensions only work with the exact DuckDB version they were built for (dev and UAT both have v1.5.5). The tool uses `bundle/duckdb` when it exists; the `DUCKDB=<path>` setting is used only when there is no `bundle/duckdb`
+   (a `DUCKDB=...` line typed on its own in the terminal is not seen by the script: use `export DUCKDB=...` or put it in front of the command). Using the server's own CLI instead of `bundle/duckdb` was not tested.
 
 ## 3. Create the config for your job
 
@@ -89,6 +94,21 @@ Notes:
 - **Always give a real `*_HOST` when DuckDB / DuckLake is involved.** An empty host (local socket) was tested only for Postgres -> Postgres; the DuckDB paths were tested over the network (host and port) only.
 - Hosts and schemas differ per environment. Use the values of that environment; do not copy dev's. Known: dev Postgres `192.168.50.218`, UAT Postgres `10.201.170.205`
   (the counter-def tool uses these). **Confirm every host, database and schema with the environment owner**: the DuckLake schema on dev is `gsb_data_kpi_pivot_dev_V2` (with `_V2`).
+
+### 3.2 DuckLake to DuckLake, and DuckLake across environments (tunnel, data folder)
+
+DuckLake has two parts: the metadata (a Postgres database, reached with `*_HOST`, `*_PORT`, `*_DB`) and the parquet data files (a folder, `*_DUCKLAKE_DATA_PATH`).
+The catalog stores the file paths (for example `/abc/parquet.file`), and DuckDB opens those paths directly. **The tool assumes the machine that runs it can open both data folders.** On dev this is true (`/mnt/mfs` is shared).
+
+If there is no direct route (for example UAT cannot reach prod) a tunnel solves only the metadata part: put the tunnel address in `SOURCE_HOST` / `SOURCE_PORT`. It does not help with the files.
+If the source data folder exists only on another server, use one of these (config and setup only, no code change):
+
+| Option | How |
+|---|---|
+| A | Make the source data folder visible on the machine that runs the tool, read-only, **at the same path** (a mount; ask the infrastructure team). Then DuckLake to DuckLake runs as one import |
+| B | Two steps with a DuckDB file in between. Step 1, on the source side: DuckLake -> `duckdb` file (`TARGET_TYPE="duckdb"`, `TARGET_DB_FILE=...`). Step 2: copy the file to the target side. Step 3, on the target side: `duckdb` file -> DuckLake. Each step is a tested combination; the chain with a real prod and UAT was not run |
+
+Tested on dev: DuckLake to DuckLake inside one catalog (two different schemas, one DuckDB session with both attached). Two separate catalogs (prod and UAT) were not tested.
 
 ### 3.2 What to copy
 
@@ -348,9 +368,14 @@ If you cannot solve it: do not run the real step. Keep the folder `reports/<date
 ## 11. What was tested, and what was not
 
 Tested on dev with real data (see [docs/EVIDENCE.md](docs/EVIDENCE.md)): Postgres -> Postgres (80,445 rows), DuckLake -> Postgres (40,921 rows) running from the offline `bundle/`,
-DuckDB file -> DuckDB file (40,921 rows); replace, backup on/off, dry-run rollback, a failing import rolled back, `stop`, `append`, `FULL_COPY_TABLES`, table-name mapping, the Sydney time zone.
+DuckDB file -> DuckDB file, DuckDB file -> DuckLake and parquet -> DuckDB (40,921 rows each); replace, backup on/off, dry-run rollback, a failing import rolled back, `stop`, `append`, `FULL_COPY_TABLES`, table-name mapping, the Sydney time zone.
 
-**Not tested:** DuckLake as a *target*, parquet as a source, `ON_ERROR="continue"`, the prod confirmation prompt on a terminal, and a server that has no network at all.
+Also tested: `ON_ERROR` `stop` and `continue`, the prod confirmation prompt (wrong, empty and correct answer, no terminal, `--yes`), and `--dry-run` against a DuckLake target.
+DuckLake -> DuckLake (40,921 rows, `--check`, `--dry-run`, real run, equal row for row) was tested inside the one dev catalog (source schema `gsb_data_kpi_pivot_dev_V2`, scratch target schema `dbimport_demo_dl`).
+
+**Not tested:** two separate DuckLake catalogs (for example prod and UAT), a route between environments through a tunnel, and a source data folder that exists only on another server (see section 3.2).
+
+**Not tested:** a server that has no network at all (only UAT / prod can prove that; on dev the bundle was proven to load with an empty home folder and auto-download off).
 UAT and prod themselves could not be tested (no access). That is why you run `--check` and `--dry-run` first, and why the first real run there should be a small period.
 
 ## 12. Checklist

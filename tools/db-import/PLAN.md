@@ -9,7 +9,7 @@ Status: **Plan signed off by the user (2026-11-12). Code written on branch `feat
 | 1 Sign-off | ✅ done 2026-11-12 (all parking-lot items answered) |
 | 2 Postgres -> Postgres path + config + report | ✅ done, tested on dev (docs/EVIDENCE.md sections 4 and 5) |
 | 3 Test on dev (scratch schema, before/after evidence) | ✅ done: 44 / 44 scratch checks and a real-data run (80445 rows) |
-| 4 DuckDB paths | ✅ DuckLake -> Postgres and DuckDB file -> DuckDB file tested on real data (40921 rows); DuckLake target and parquet source not yet run |
+| 4 DuckDB paths | ✅ DuckLake -> Postgres, DuckDB file -> DuckDB file and DuckDB file -> DuckLake and parquet -> DuckDB all tested on real data (40921 rows) |
 | 5 `prepare-bundle.sh` + offline test | ✅ bundle built on dev and used by the run; ⏳ not tested on a machine with no network |
 | 6 README + RUNBOOK, UAT/prod checklist | ✅ README and RUNBOOK.md written (2026-11-12); the runbook has not been followed by someone else yet |
 
