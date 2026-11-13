@@ -26,11 +26,12 @@ You run it in three steps, always in this order:
 |---|---|
 | Postgres -> Postgres | `bash` 4 or newer and `psql`. Nothing else |
 | anything with DuckDB, DuckLake or parquet | `bash` 4 or newer and the `bundle/` folder (it contains the DuckDB program and its extensions) |
+| a source read through the Flight SQL API (`flightsql`, section 3.5) | the same, plus `python3`, and the Python packages in `bundle/pylibs` (built with `./prepare-bundle.sh --with-flightsql`) |
 
 Check: `bash --version | head -1` and `psql --version`. No internet is needed, ever.
 The machine must be able to reach both databases (host and port). It can be a machine other than the database servers.
 **DuckLake needs more than the connection:** the metadata Postgres is reached by host and port (a tunnel is fine), but DuckDB reads and writes the DuckLake parquet files itself, straight from the data folder (`*_DUCKLAKE_DATA_PATH`).
-So the machine that runs the tool must also be able to open the source data folder (read) and the target data folder (write). A tunnel does not carry those files. See section 3.2.
+So the machine that runs the tool must also be able to open the source data folder (read) and the target data folder (write). A tunnel does not carry those files. See section 3.2. If the source is on another network, read it through its Flight SQL API instead (section 3.5).
 
 Permissions of the database user:
 
@@ -65,6 +66,10 @@ If the user cannot create the backup tables, ask your DBA for the right, or set 
    **Never run `prepare-bundle.sh` on UAT or prod:** it downloads the extensions, so it needs internet. Run it once on dev (or any machine with internet and the same DuckDB version), then copy `bundle/` over.
    The extensions only work with the exact DuckDB version they were built for (dev and UAT both have v1.5.5). The tool uses `bundle/duckdb` when it exists; the `DUCKDB=<path>` setting is used only when there is no `bundle/duckdb`
    (a `DUCKDB=...` line typed on its own in the terminal is not seen by the script: use `export DUCKDB=...` or put it in front of the command). Using the server's own CLI instead of `bundle/duckdb` was not tested.
+5. **Only for a `flightsql` source:** the bundle must also hold the Python packages (`bundle/pylibs`). On the machine with internet run once `./prepare-bundle.sh --tar --with-flightsql`
+   (it needs `python3` and `pip`, installs pyarrow, adbc-driver-flightsql and adbc-driver-manager into `bundle/pylibs`, saves the Python version in `bundle/pylibs/PYVERSION` and proves they load with an empty home folder).
+   **Use the same Python minor version as the server that will run the tool** (check `python3 --version` there): the packages only work with the Python they were built for, and the tool refuses to run otherwise.
+   `pylibs` is large (about 170 MB unpacked on dev), so the copy takes a while. The tool checks it with the other bundle checksums.
 
 ## 3. Create the config for your job
 
@@ -81,7 +86,7 @@ Fill in the sections below. Rules for the file: plain `NAME="value"` lines, no s
 
 | Setting | Meaning |
 |---|---|
-| `SOURCE_TYPE` / `TARGET_TYPE` | `postgres`, `duckdb` (a .duckdb file), `ducklake`, or `parquet` (source only) |
+| `SOURCE_TYPE` / `TARGET_TYPE` | `postgres`, `duckdb` (a .duckdb file), `ducklake`; a source can also be `parquet` or `flightsql` (the source environment's API, section 3.5) |
 | `TARGET_ENV` | `dev`, `uat` or `prod`. **Set it to the real environment of the target.** With `prod` the tool asks you to type the database name before it writes |
 | `*_HOST`, `*_PORT`, `*_DB`, `*_USER` | the Postgres connection. For `ducklake` these are the connection of the Postgres database that holds the DuckLake metadata (database `ducklake`) |
 | `*_SCHEMA` | the schema of the tables (Postgres schema, or `main` for a .duckdb file, or the DuckLake schema) |
@@ -108,9 +113,11 @@ If the source data folder exists only on another server, use one of these (confi
 | A | Make the source data folder visible on the machine that runs the tool, read-only, **at the same path** (a mount; ask the infrastructure team). Then DuckLake to DuckLake runs as one import |
 | B | Two steps with a DuckDB file in between. Step 1, on the source side: DuckLake -> `duckdb` file (`TARGET_TYPE="duckdb"`, `TARGET_DB_FILE=...`). Step 2: copy the file to the target side. Step 3, on the target side: `duckdb` file -> DuckLake. Each step is a tested combination; the chain with a real prod and UAT was not run |
 
+| C | **When the networks are separated (UAT cannot reach prod): read the source through its Flight SQL API** (`SOURCE_TYPE="flightsql"`, section 3.5). Only a tunnel to the API port is needed; no data folder, no metadata Postgres of the source. Tested on dev against the dev API |
+
 Tested on dev: DuckLake to DuckLake inside one catalog (two different schemas, one DuckDB session with both attached). Two separate catalogs (prod and UAT) were not tested.
 
-### 3.2 What to copy
+### 3.3 What to copy
 
 | Setting | Meaning | Example |
 |---|---|---|
@@ -134,7 +141,7 @@ Why `TIMEZONE` matters: some tables store the time with a time zone (the DuckLak
 The tool needs the same column names on both sides: every column of the source table must exist in the target table (the target may have extra columns, which get their default).
 The target table must already exist. The tool never creates tables.
 
-### 3.3 How it behaves
+### 3.4 How it behaves
 
 | Setting | Values | Meaning |
 |---|---|---|
@@ -149,6 +156,55 @@ The target table must already exist. The tool never creates tables.
 | `OFFLINE` | `yes` (default) / `no` | yes: DuckDB uses only `bundle/` (leave it `yes` on UAT and prod) |
 | `DUCKDB` | path | only if you must use another DuckDB program; `bundle/duckdb` is used first |
 | `REPORT_DIR` | folder | where each run writes its report (default `./reports`). Must be writable by the user who runs the tool |
+
+### 3.5 Reading through the Flight SQL API (`SOURCE_TYPE="flightsql"`)
+
+**When to use it.** The source database's data files cannot be reached from this machine (for example prod from UAT: the networks are separated), but you can reach the **gsb-kpi-data-api** of the source environment, usually through a tunnel to its Flight SQL port (8815 by default).
+The tool asks the API for the period in small time slices, saves them as parquet files on this machine, then imports those files into the target (same backup, one transaction, row-count check and `--dry-run` as always).
+
+**What it needs**
+
+| Need | Detail |
+|---|---|
+| The API | its Flight SQL listener must be on (`FLIGHTSQL__ENABLED=true`) and reachable from this machine, directly or through a tunnel. It has no login and no TLS: the tunnel is the protection. Check the port: `bash -c '</dev/tcp/localhost/8815' && echo open` |
+| Python 3 | `python3` on this machine, and the packages in `bundle/pylibs` (pyarrow, adbc-driver-flightsql, adbc-driver-manager). Nothing is installed from the internet: on UAT / prod copy the `bundle/` built with `./prepare-bundle.sh --with-flightsql` (section 2) |
+| The target | any target the tool supports (tested: DuckLake). Its tables must exist, as always |
+| Disk space | the exported parquet files stay in `EXPORT_DIR` (see below) |
+
+**Settings** (add them to the config; the target side is as in any other job)
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `SOURCE_TYPE="flightsql"` | read through the API | |
+| `SOURCE_HOST`, `SOURCE_PORT` | the API, or the local address and port of the tunnel to it | |
+| `SOURCE_SCHEMA` | the schema on the API, e.g. `gsb_data_kpi_pivot` | |
+| `TABLES`, `PERIOD_FROM`, `PERIOD_TO`, `TIMEZONE` | as for every job (`TIMEZONE="Australia/Sydney"`) | |
+| `FLIGHT_MAX_ROWS` | the API's row cap (`FLIGHTSQL__MAX_ROWS` on the API: ask its owner). A slice that returns this many rows **or more** fails the table, because the API cuts a bigger result silently | 100000 |
+| `FLIGHT_SLICE_MINUTES` | length of one time slice | 10 |
+| `FLIGHT_PAUSE_SECONDS` | wait between two slices, so the API (which prod users share) is not loaded | 2 |
+| `FLIGHT_TIMEOUT_SECONDS` | time limit of one query | 120 |
+| `EXPORT_DIR` | where the parquet files go, as `<EXPORT_DIR>/<TABLE>/*.parquet` | `reports/<run>/export` |
+| `EXPORT_KEEP` | `yes` keeps the files after the run, so the same data can be imported again without asking the API; `no` removes them at the end | `yes` |
+| `EXPORT_OVERWRITE` | `yes` replaces an earlier export of the same table in `EXPORT_DIR`; `no` refuses (an old copy is never mixed with a new one) | `no` |
+| `PYTHON` | the Python program | `python3` |
+
+There is no `SOURCE_PASSWORD_ENV` for this source (the API has no login). The time column is found by name, upper or lower case (`TIME_COLUMN`, default `PERIOD_START_TIME`; `TABLE_TIME_COLUMNS` for another name).
+
+**What a run does**
+1. `--check`: for each table the API is asked for its structure and one row count for the period. Nothing is exported and nothing is written.
+2. The plan is printed (and, for a prod target, you confirm). Only then the export starts: one slice at a time, with a pause, into `EXPORT_DIR`.
+3. The exported files are imported like a parquet source. The row-count check uses the number of rows that were really exported.
+
+**Run it in two steps, or later again**
+- Only fetch the data, touching no database (the `TARGET_*` settings are not used and no target password is needed): `./db-import.sh --export-only configs/<job>.env`. The files are kept.
+- Import kept files later, with no new load on the API: a normal job with `SOURCE_TYPE="parquet"`, `SOURCE_SCHEMA="main"` and `SOURCE_PARQUET_GLOB="<EXPORT_DIR>/{TABLE}/*.parquet"`.
+- A `--dry-run` also exports (it needs the real data). If you then run the real step with the same fixed `EXPORT_DIR`, the tool refuses because the files exist: set `EXPORT_OVERWRITE="yes"`, or leave `EXPORT_DIR` empty so every run gets its own folder, or import the kept files as described above.
+
+**Good to know**
+- The time filter is built by the tool from the period (as exact UTC instants for columns with a time zone, as local time for columns without one). It is not the API's own time conversion, which shifts a plain filter by 11 hours on some tables. You do not need to do anything.
+- The query is always `SELECT * FROM <schema>."<table>" WHERE <time column> in the slice`. You choose tables and period; you cannot add other filters.
+- Only a time column of type timestamp is supported. Another type, or a table without the column, stops the run with a message.
+- The row cap: pick `FLIGHT_SLICE_MINUTES` so that one slice is far below `FLIGHT_MAX_ROWS`. If it still fails, lower it. The data of one single time stamp cannot be split further.
 
 ## 4. Passwords
 
@@ -165,6 +221,7 @@ The variable must be set in the **same terminal** where you run the tool; it is 
 **B. `~/.pgpass`** of the user who runs the tool (a line `host:port:database:user:password`, `chmod 600`). Leave `*_PASSWORD_ENV=""`.
 
 The plain `PGPASSWORD` variable is ignored on purpose, so that two databases never share one password by mistake.
+A `flightsql` source has no password (the API has no login): only the target password is needed.
 
 ## 5. Run
 
@@ -305,6 +362,35 @@ OFFLINE="yes"
 ```
 A .duckdb file can be opened by one program at a time: nobody else may have the target file open while you run.
 
+**D. Prod API (Flight SQL, through a tunnel) -> UAT DuckLake** (the tunnel from this machine to the prod API listens on `localhost:8815`)
+```bash
+JOB_NAME="prod_api_to_uat_ducklake"
+SOURCE_TYPE="flightsql"
+SOURCE_HOST="localhost"                # the tunnel
+SOURCE_PORT="8815"
+SOURCE_SCHEMA="gsb_data_kpi_pivot"
+TARGET_TYPE="ducklake"
+TARGET_ENV="uat"
+TARGET_HOST="<UAT metadata Postgres host>"
+TARGET_PORT="5432"
+TARGET_DB="ducklake"
+TARGET_USER="postgres"
+TARGET_PASSWORD_ENV="TARGET_PGPASSWORD"
+TARGET_DUCKLAKE_DATA_PATH="<UAT DuckLake data path>"
+TARGET_DUCKLAKE_METADATA_SCHEMA="metadata"
+TARGET_SCHEMA="gsb_data_kpi_pivot"
+TABLES="KPI_NS_QRLY_NODE_CEM_ERS_NEW_P"
+PERIOD_FROM="2026-10-25"
+PERIOD_TO="2026-10-25 02:00"
+TIMEZONE="Australia/Sydney"
+FLIGHT_MAX_ROWS="100000"               # the API's real cap
+FLIGHT_SLICE_MINUTES="10"
+FLIGHT_PAUSE_SECONDS="2"
+EXPORT_KEEP="yes"
+OFFLINE="yes"
+```
+Only `TARGET_PASSWORD_ENV` needs a password. Run `--check`, then `--dry-run`, then the real run, as always.
+
 ## 8. Undo a run
 
 Only possible if the run had `BACKUP="on"`. The saved rows are in the target database, in the table named in the run log / `summary.csv` (column `backup_table`).
@@ -352,6 +438,13 @@ Every message below is printed before anything is written, unless stated. Exit c
 | `row count check failed: expected N, found M` (table FAILED, rolled back) | the source changed during the run, or a trigger/rule changed the rows on the target. Nothing was changed for that table. Run again |
 | `FAILED: exit code ...; the transaction was rolled back` | read the error printed just above it (a constraint, a type mismatch, a lost connection). The target keeps its old rows for that table |
 | `DuckDB could not read the table columns` | the error just above says why: a wrong DuckLake schema or data path, a wrong password, or a file that does not exist |
+| `Python cannot load pyarrow / adbc_driver_flightsql` | `bundle/pylibs` is missing or incomplete: build it on a machine with internet with `./prepare-bundle.sh --with-flightsql` and copy `bundle/` (section 2) |
+| `bundle/pylibs was built for Python 'X' but this machine's python3 is 'Y'` | the packages only work with the Python they were built for: rebuild with the same Python version as this machine |
+| `cannot connect to the Flight SQL API at <host>:<port>` | the tunnel is not up, or the host or port is wrong, or the API's Flight SQL is off. Test: `bash -c '</dev/tcp/<host>/<port>' && echo open` |
+| `the API rejected or failed a query: ...` | read the text after it: a wrong schema or table name, a timeout (raise `FLIGHT_TIMEOUT_SECONDS` or lower `FLIGHT_SLICE_MINUTES`), or the API is busy |
+| `slice N of M (...) returned R rows, which is the row cap` | the API may have cut the result, so the table is not imported. Lower `FLIGHT_SLICE_MINUTES`. If the cap on the API differs from `FLIGHT_MAX_ROWS`, set it to the real value |
+| `the table has no time column '...'` / `time column '...' has type ...` | set `TIME_COLUMN` or `TABLE_TIME_COLUMNS` (section 6); only timestamp columns are supported |
+| `... already holds files from an earlier export` | an earlier export is in `EXPORT_DIR`: use another folder, leave `EXPORT_DIR` empty, or set `EXPORT_OVERWRITE="yes"` (section 3.5) |
 
 If you cannot solve it: do not run the real step. Keep the folder `reports/<date_time>_<job>/` (it has the complete log) and send it with the config (`config_used.env` in it).
 
@@ -373,7 +466,10 @@ DuckDB file -> DuckDB file, DuckDB file -> DuckLake and parquet -> DuckDB (40,92
 Also tested: `ON_ERROR` `stop` and `continue`, the prod confirmation prompt (wrong, empty and correct answer, no terminal, `--yes`), and `--dry-run` against a DuckLake target.
 DuckLake -> DuckLake (40,921 rows, `--check`, `--dry-run`, real run, equal row for row) was tested inside the one dev catalog (source schema `gsb_data_kpi_pivot_dev_V2`, scratch target schema `dbimport_demo_dl`).
 
-**Not tested:** two separate DuckLake catalogs (for example prod and UAT), a route between environments through a tunnel, and a source data folder that exists only on another server (see section 3.2).
+**Flight SQL source** (section 3.5), tested on dev against the dev API with real data: API -> DuckLake (40,921 rows: `--check`, `--dry-run`, real run, equal row for row, the 40,921 old rows replaced and saved in the backup), a table with a time zone and a table without one,
+the row-cap failure (nothing written), `--export-only` (no password needed), importing the kept files later with no API call, `EXPORT_KEEP="no"`, and the offline bundle with `pylibs` (empty home folder; a bundle built for another Python is refused). See `docs/EVIDENCE.md` and `PLAN-FLIGHTSQL.md` (sections 9 to 12).
+
+**Not tested:** two separate DuckLake catalogs (for example prod and UAT) read directly; a real tunnel from UAT to the prod API, the prod API itself (its version, row cap and tables may differ from dev) and UAT's Python (the bundle must be built for it); the Flight SQL source with a Postgres target.
 
 **Not tested:** a server that has no network at all (only UAT / prod can prove that; on dev the bundle was proven to load with an empty home folder and auto-download off).
 UAT and prod themselves could not be tested (no access). That is why you run `--check` and `--dry-run` first, and why the first real run there should be a small period.

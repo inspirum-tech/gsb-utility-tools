@@ -1,13 +1,16 @@
 #!/usr/bin/env bash
 # db-import.sh - copy tables for one time period from a source database to a target database.
 #
-#   ./db-import.sh [--check | --dry-run] [--yes] <config.env>
+#   ./db-import.sh [--check | --dry-run] [--export-only] [--yes] <config.env>
 #
-#   --check    read-only: connect, compare columns, count rows, print the plan, change nothing
-#   --dry-run  do the whole import inside a transaction, run the checks, then ROLLBACK
-#   --yes      do not ask for confirmation when TARGET_ENV=prod (for unattended runs)
+#   --check        read-only: connect, compare columns, count rows, print the plan, change nothing
+#   --dry-run      do the whole import inside a transaction, run the checks, then ROLLBACK
+#   --export-only  SOURCE_TYPE=flightsql only: fetch the data into EXPORT_DIR (parquet files), touch no database
+#   --yes          do not ask for confirmation when TARGET_ENV=prod (for unattended runs)
 #
-# Source: postgres | duckdb | ducklake | parquet.  Target: postgres | duckdb | ducklake.
+# Source: postgres | duckdb | ducklake | parquet | flightsql.  Target: postgres | duckdb | ducklake.
+# flightsql = the gsb-kpi-data-api Flight SQL interface, read in small time slices by flightsql_export.py
+# (python3 + pyarrow + adbc-driver-flightsql from bundle/pylibs); the files are then imported like parquet.
 # Postgres -> Postgres uses psql only. Every other combination uses the DuckDB CLI, with its
 # extensions loaded from ./bundle (built once on a machine with internet by prepare-bundle.sh), so
 # nothing is downloaded on an offline server. Everything is set in the config file; see
@@ -133,6 +136,7 @@ side_fingerprint() {
         postgres|ducklake) printf '%s:%s/%s' "$(v "${P}_HOST")" "$(v "${P}_PORT")" "$(v "${P}_DB")" ;;
         duckdb)            printf '%s' "$(v "${P}_DB_FILE")" ;;
         parquet)           printf 'parquet:%s' "$(v "${P}_PARQUET_GLOB")" ;;
+        flightsql)         printf 'flightsql:%s:%s' "$(v "${P}_HOST")" "$(v "${P}_PORT")" ;;
     esac
 }
 
@@ -162,11 +166,19 @@ validate_side() {
             [ -n "$(v "${P}_DB_FILE")" ] || die "${P}_DB_FILE is not set"
             check_re "${P}_DB_FILE" "$(v "${P}_DB_FILE")" "$re_path"
             check_re "${P}_SCHEMA" "$(v "${P}_SCHEMA")" "$re_ident" ;;
+        flightsql)
+            [ "$P" = SOURCE ] || die "TARGET_TYPE=flightsql is not supported (the API is read-only: it can only be a source)"
+            [ -n "$(v "${P}_HOST")" ]   || die "${P}_HOST is not set (the address of the Flight SQL API, or of the tunnel to it)"
+            [ -n "$(v "${P}_PORT")" ]   || die "${P}_PORT is not set (the API's Flight SQL port, 8815 by default)"
+            [ -n "$(v "${P}_SCHEMA")" ] || die "${P}_SCHEMA is not set (the schema on the API, e.g. gsb_data_kpi_pivot)"
+            check_re "${P}_HOST" "$(v "${P}_HOST")" "$re_host"
+            check_re "${P}_PORT" "$(v "${P}_PORT")" "$re_port"
+            check_re "${P}_SCHEMA" "$(v "${P}_SCHEMA")" "$re_ident" ;;
         parquet)
             [ "$P" = SOURCE ] || die "TARGET_TYPE=parquet is not supported (parquet can only be a source)"
             [ -n "$(v "${P}_PARQUET_GLOB")" ] || die "${P}_PARQUET_GLOB is not set (example: /data/{TABLE}/*.parquet)"
             check_re "${P}_PARQUET_GLOB" "$(v "${P}_PARQUET_GLOB")" "$re_path" ;;
-        *) die "${P}_TYPE must be postgres, duckdb, ducklake or parquet (target: not parquet); got '$type'" ;;
+        *) die "${P}_TYPE must be postgres, duckdb, ducklake, parquet or flightsql (target: only postgres, duckdb, ducklake); got '$type'" ;;
     esac
     pwval "$P" >/dev/null
 }
@@ -249,7 +261,7 @@ duck_attach() { # side readonly(yes|no)
         ducklake) printf "ATTACH 'ducklake:postgres:%s' AS %s (DATA_PATH '%s', METADATA_SCHEMA '%s'%s);\n" \
                       "$(sqlq "$(pg_conninfo "$P")")" "$alias" "$(sqlq "$(v "${P}_DUCKLAKE_DATA_PATH")")" \
                       "$(sqlq "$(v "${P}_DUCKLAKE_METADATA_SCHEMA")")" "$opt" ;;
-        parquet)  : ;;   # read with read_parquet(), nothing to attach
+        parquet|flightsql) : ;;   # read with read_parquet() (flightsql: the exported files), nothing to attach
     esac
 }
 
@@ -281,6 +293,8 @@ tbl_expr() { # side table
     if [ "$(v "${P}_TYPE")" = parquet ]; then
         local g; g="$(v "${P}_PARQUET_GLOB")"
         printf "read_parquet('%s')" "$(sqlq "${g//\{TABLE\}/$t}")"
+    elif [ "$(v "${P}_TYPE")" = flightsql ]; then
+        printf "read_parquet('%s')" "$(sqlq "$EXPORT_DIR/$t/*.parquet")"
     else
         printf '%s."%s"."%s"' "$alias" "$(v "${P}_SCHEMA")" "$t"
     fi
@@ -327,7 +341,7 @@ setup_duck() {
     DUCK_EXTS=""
     local P t; for P in SOURCE TARGET; do
         t="$(v "${P}_TYPE")"
-        case "$t" in postgres) DUCK_EXTS+=" postgres" ;; ducklake) DUCK_EXTS+=" postgres ducklake" ;; parquet) DUCK_EXTS+=" parquet" ;; esac
+        case "$t" in postgres) DUCK_EXTS+=" postgres" ;; ducklake) DUCK_EXTS+=" postgres ducklake" ;; parquet|flightsql) DUCK_EXTS+=" parquet" ;; esac
     done
     DUCK_EXTS="$(printf '%s\n' $DUCK_EXTS | sort -u | tr '\n' ' ')"
     log "DuckDB: $DUCK_BIN ($(duck_version_of "$DUCK_BIN")); extensions needed: ${DUCK_EXTS:-none}"
@@ -358,6 +372,103 @@ setup_duck() {
 declare -a SRC_T TGT_T SRC_COLS TGT_COLS COMMON MODE TC WHERE SRC_CNT TGT_CNT EXPECT BK_NAME
 declare -a STATUS AFTER BKROWS SECS MSG
 
+# ---------------------------------------------------------------------------------------------
+# Source "flightsql": the gsb-kpi-data-api Flight SQL interface, read through flightsql_export.py
+# (python3 + pyarrow + adbc-driver-flightsql). The helper writes parquet files into EXPORT_DIR; the
+# normal parquet path then imports them. Settings: FLIGHT_* and EXPORT_* (config.example.env).
+# ---------------------------------------------------------------------------------------------
+declare -a FL_COL FL_KIND
+FL_EXPORTED=""
+
+set_expect() { # i : the row count the target must show after the import
+    local i="$1"
+    case "$LOAD_MODE" in
+        replace|stop) EXPECT[$i]="${SRC_CNT[$i]}" ;;
+        append)       EXPECT[$i]=$(( ${TGT_CNT[$i]} + ${SRC_CNT[$i]} )) ;;
+    esac
+}
+
+flight_py() { # helper arguments... ; bundle/pylibs is added when it exists
+    local pl="$BUNDLE_DIR/pylibs"
+    if [ -d "$pl" ]; then
+        "$PYTHON" "$HERE/flightsql_export.py" "$@" --pylibs "$pl"
+    else
+        "$PYTHON" "$HERE/flightsql_export.py" "$@"
+    fi
+}
+
+setup_flight() {
+    command -v "$PYTHON" >/dev/null 2>&1 || die "Python not found ('$PYTHON'). Set PYTHON=<path to python3> in the config."
+    [ -f "$HERE/flightsql_export.py" ] || die "flightsql_export.py is missing next to db-import.sh"
+    log "Python: $("$PYTHON" --version 2>&1)"
+    DBI_PYLIBS="$BUNDLE_DIR/pylibs" "$PYTHON" -c 'import os, sys; sys.path.insert(0, os.environ["DBI_PYLIBS"]); import adbc_driver_flightsql.dbapi, pyarrow.parquet' >/dev/null 2>&1 \
+        || die "Python cannot load pyarrow / adbc_driver_flightsql. Build bundle/pylibs on a machine with internet (./prepare-bundle.sh --with-flightsql, RUNBOOK) and copy bundle/ here."
+    if [ -f "$BUNDLE_DIR/pylibs/PYVERSION" ]; then
+        local want have
+        want="$(tr -d '\r\n' <"$BUNDLE_DIR/pylibs/PYVERSION")"
+        have="$("$PYTHON" -c 'import sys, platform; print("%d.%d %s" % (sys.version_info[0], sys.version_info[1], platform.machine()))')"
+        [ "$want" = "$have" ] || die "bundle/pylibs was built for Python '$want' but this machine's $PYTHON is '$have'. Rebuild it with the same Python (./prepare-bundle.sh --with-flightsql on a machine with internet)."
+    fi
+}
+
+flight_probe_all() { # one structure read and one count(*) per table; fills SRC_COLS, SRC_CNT, FL_COL, FL_KIND
+    local i st tc out line
+    log "Flight SQL source $SOURCE_HOST:$SOURCE_PORT, schema $SOURCE_SCHEMA (structure and one row count per table)"
+    for i in "${!SRC_T[@]}"; do
+        st="${SRC_T[$i]}"; tc="$(tcol_for "$st")"
+        out="$(flight_py probe --host "$SOURCE_HOST" --port "$SOURCE_PORT" --schema "$SOURCE_SCHEMA" --table "$st" \
+            --time-column "$tc" --from-local "$FROM_TS" --to-local "$TO_TS" --timezone "$TIMEZONE" \
+            --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS")" \
+            || die "Flight SQL: cannot read $st (see the error above). Nothing was changed."
+        SRC_COLS[$i]=""; FL_COL[$i]=""; FL_KIND[$i]=""; SRC_CNT[$i]=""
+        while IFS= read -r line; do
+            case "$line" in
+                TYPE,*)   FL_KIND[$i]="${line#TYPE,}" ;;
+                COLUMN,*) FL_COL[$i]="${line#COLUMN,}" ;;
+                COUNT,*)  SRC_CNT[$i]="${line#COUNT,}" ;;
+                SCOL,*)   SRC_COLS[$i]+="${line#SCOL,}"$'\n' ;;
+            esac
+        done <<<"$out"
+        [[ "${SRC_CNT[$i]}" =~ ^[0-9]+$ ]] || die "Flight SQL: no row count came back for $st"
+        [ -n "${SRC_COLS[$i]}" ] || die "Flight SQL: no columns came back for $st"
+        log "    $st: time column ${FL_COL[$i]} (${FL_KIND[$i]}), $(printf '%s' "${SRC_COLS[$i]}" | grep -c .) columns, ${SRC_CNT[$i]} rows in the period"
+    done
+}
+
+flight_export_all() { # reads every table slice by slice into EXPORT_DIR/<TABLE>/*.parquet
+    local i st tc tot ow=""
+    [ "$EXPORT_OVERWRITE" = yes ] && ow="--overwrite"
+    mkdir -p "$EXPORT_DIR"
+    log "exporting from the API: slices of $FLIGHT_SLICE_MINUTES min, pause $FLIGHT_PAUSE_SECONDS s, row cap $FLIGHT_MAX_ROWS, into $EXPORT_DIR"
+    for i in "${!SRC_T[@]}"; do
+        st="${SRC_T[$i]}"; tc="$(tcol_for "$st")"
+        FL_EXPORTED+=" $st"
+        log "    [$((i+1))/${#SRC_T[@]}] $st"
+        if ! flight_py export --host "$SOURCE_HOST" --port "$SOURCE_PORT" --schema "$SOURCE_SCHEMA" --table "$st" \
+                --time-column "$tc" --from-local "$FROM_TS" --to-local "$TO_TS" --timezone "$TIMEZONE" \
+                --slice-minutes "$FLIGHT_SLICE_MINUTES" --pause-seconds "$FLIGHT_PAUSE_SECONDS" \
+                --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS" \
+                --out-dir "$EXPORT_DIR" $ow | tee "$TMP/fl_$i.out" | sed -n 's/^SLICE,/        slice /p'; then
+            die "reading $st from the API stopped (the reason is in the error above). Nothing was imported."
+        fi
+        tot="$(grep -m1 '^TOTAL,' "$TMP/fl_$i.out" | cut -d, -f2 || true)"
+        [[ "$tot" =~ ^[0-9]+$ ]] || die "Flight SQL export of $st did not report a total"
+        if [ "$tot" != "${SRC_CNT[$i]}" ]; then
+            warn "$st: the API returned $tot rows but the earlier count said ${SRC_CNT[$i]} (the data changed in between). The $tot exported rows are used."
+            SRC_CNT[$i]="$tot"
+            [ "$EXPORT_ONLY" = yes ] || set_expect "$i"
+        fi
+    done
+}
+
+flight_cleanup() { # EXPORT_KEEP=no: remove the table folders this run wrote
+    [ "${SOURCE_TYPE:-}" = flightsql ] && [ "${EXPORT_KEEP:-yes}" = no ] || return 0
+    local t
+    for t in $FL_EXPORTED; do rm -rf "${EXPORT_DIR:?}/$t"; done
+    rmdir "$EXPORT_DIR" 2>/dev/null || true
+    return 0
+}
+
 load_config() {
     [ -f "$CONF" ] || die "config not found: $CONF"
     if grep -q $'\r' "$CONF"; then die "config has Windows line endings. Run: dos2unix $CONF"; fi
@@ -372,16 +483,34 @@ load_config() {
     : "${TIME_COLUMN:=PERIOD_START_TIME}" "${TABLE_TIME_COLUMNS:=}" "${FULL_COPY_TABLES:=}"
     : "${PERIOD_FROM:=}" "${PERIOD_TO:=}" "${TABLES:=}" "${ON_ERROR:=stop}"
     : "${TIMEZONE:=UTC}"
+    : "${FLIGHT_SLICE_MINUTES:=10}" "${FLIGHT_PAUSE_SECONDS:=2}" "${FLIGHT_MAX_ROWS:=100000}" "${FLIGHT_TIMEOUT_SECONDS:=120}"
+    : "${EXPORT_DIR:=}" "${EXPORT_KEEP:=yes}" "${EXPORT_OVERWRITE:=no}" "${PYTHON:=python3}"
     : "${OFFLINE:=yes}" "${DUCKDB:=duckdb}" "${BUNDLE_DIR:=$HERE/bundle}" "${REPORT_DIR:=$HERE/reports}"
 }
 
 validate_config() {
-    validate_side SOURCE; validate_side TARGET
-    case "$TARGET_ENV" in dev|uat|prod) ;; *) die "TARGET_ENV must be dev, uat or prod (it decides whether a confirmation is asked)";; esac
+    validate_side SOURCE
+    if [ "${EXPORT_ONLY:-no}" = yes ]; then
+        [ "$SOURCE_TYPE" = flightsql ] || die "--export-only needs SOURCE_TYPE=flightsql"
+    else
+        validate_side TARGET
+        case "$TARGET_ENV" in dev|uat|prod) ;; *) die "TARGET_ENV must be dev, uat or prod (it decides whether a confirmation is asked)";; esac
+    fi
     case "$LOAD_MODE" in replace|append|stop) ;; *) die "LOAD_MODE must be replace, append or stop";; esac
     case "$BACKUP" in on|off) ;; *) die "BACKUP must be on or off";; esac
     case "$ON_ERROR" in stop|continue) ;; *) die "ON_ERROR must be stop or continue";; esac
     case "$OFFLINE" in yes|no) ;; *) die "OFFLINE must be yes or no";; esac
+    if [ "$SOURCE_TYPE" = flightsql ]; then
+        local n
+        for n in FLIGHT_SLICE_MINUTES FLIGHT_MAX_ROWS FLIGHT_TIMEOUT_SECONDS; do
+            [[ "$(v "$n")" =~ ^[1-9][0-9]*$ ]] || die "$n must be a whole number of 1 or more; got '$(v "$n")'"
+        done
+        [[ "$FLIGHT_PAUSE_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "FLIGHT_PAUSE_SECONDS must be a number of seconds (0 or more); got '$FLIGHT_PAUSE_SECONDS'"
+        case "$EXPORT_KEEP" in yes|no) ;; *) die "EXPORT_KEEP must be yes or no";; esac
+        case "$EXPORT_OVERWRITE" in yes|no) ;; *) die "EXPORT_OVERWRITE must be yes or no";; esac
+        check_re PYTHON "$PYTHON" "$re_path"
+        [ -z "$EXPORT_DIR" ] || check_re EXPORT_DIR "$EXPORT_DIR" "$re_path"
+    fi
     check_re BACKUP_SCHEMA "$BACKUP_SCHEMA" "$re_ident"
     check_re TIME_COLUMN "$TIME_COLUMN" "$re_ident"
     check_re TIMEZONE "$TIMEZONE" '^[A-Za-z0-9_/+-]+$'
@@ -395,7 +524,7 @@ validate_config() {
     [[ "$FROM_TS" < "$TO_TS" ]] || die "PERIOD_FROM ($FROM_TS) must be earlier than PERIOD_TO ($TO_TS)"
     parse_tables
     if [ "$SOURCE_TYPE" = postgres ] && [ "$TARGET_TYPE" = postgres ]; then ENGINE=pg; else ENGINE=duck; fi
-    if [ "$(side_fingerprint SOURCE)" = "$(side_fingerprint TARGET)" ] && [ "$SOURCE_SCHEMA" = "$TARGET_SCHEMA" ]; then
+    if [ "${EXPORT_ONLY:-no}" = no ] && [ "$(side_fingerprint SOURCE)" = "$(side_fingerprint TARGET)" ] && [ "$SOURCE_SCHEMA" = "$TARGET_SCHEMA" ]; then
         local i; for i in "${!SRC_T[@]}"; do
             [ "${SRC_T[$i]}" != "${TGT_T[$i]}" ] || die "source and target are the same table (${SRC_T[$i]} in the same database and schema). Check SOURCE_* / TARGET_*"
         done
@@ -417,12 +546,18 @@ preflight_cols() {
     else
         local sql line tag idx col; sql="$(duck_head)"$'\n'
         for i in "${!SRC_T[@]}"; do
-            sql+="SELECT 'SCOL,$i,' || column_name FROM (DESCRIBE SELECT * FROM $(tbl_expr SOURCE "${SRC_T[$i]}"));
-SELECT 'TCOL,$i,' || column_name FROM (DESCRIBE SELECT * FROM $(tbl_expr TARGET "${TGT_T[$i]}"));
+            if [ "$SOURCE_TYPE" != flightsql ]; then      # flightsql: the source columns came from flight_probe_all
+                sql+="SELECT 'SCOL,$i,' || column_name FROM (DESCRIBE SELECT * FROM $(tbl_expr SOURCE "${SRC_T[$i]}"));
+"
+            fi
+            sql+="SELECT 'TCOL,$i,' || column_name FROM (DESCRIBE SELECT * FROM $(tbl_expr TARGET "${TGT_T[$i]}"));
 "
         done
         out="$(duck_run "$sql")" || die "DuckDB could not read the table columns (see the error above)"
-        for i in "${!SRC_T[@]}"; do SRC_COLS[$i]=""; TGT_COLS[$i]=""; done
+        for i in "${!SRC_T[@]}"; do
+            [ "$SOURCE_TYPE" = flightsql ] || SRC_COLS[$i]=""
+            TGT_COLS[$i]=""
+        done
         while IFS=, read -r tag idx col; do
             case "$tag" in
                 SCOL) SRC_COLS[$idx]+="$col"$'\n' ;;
@@ -442,7 +577,9 @@ has_col() { grep -qxF -- "$2" <<<"$1"; }
 decide_tables() {
     local i errs=0 c missing tc st
     for i in "${!SRC_T[@]}"; do
-        st="${SRC_T[$i]}"; tc="$(tcol_for "$st")"; TC[$i]="$tc"
+        st="${SRC_T[$i]}"; tc="$(tcol_for "$st")"
+        [ -z "${FL_COL[$i]:-}" ] || tc="${FL_COL[$i]}"       # flightsql: the real name (upper or lower case) found by the probe
+        TC[$i]="$tc"
         while IFS= read -r c; do
             [ -n "$c" ] || continue
             if bad_col "$c"; then echo "ERROR: $st: column name '$c' has a character that is not supported" >&2; errs=$((errs+1)); fi
@@ -483,7 +620,10 @@ preflight_counts() {
     else
         local sql tag idx s t; sql="$(duck_head)"$'\n'
         for i in "${!SRC_T[@]}"; do
-            sql+="SELECT 'CNT,$i,' || (SELECT count(*) FROM $(tbl_expr SOURCE "${SRC_T[$i]}") ${WHERE[$i]}) || ',' || (SELECT count(*) FROM $(tbl_expr TARGET "${TGT_T[$i]}") ${WHERE[$i]});
+            local scnt
+            if [ "$SOURCE_TYPE" = flightsql ]; then scnt="${SRC_CNT[$i]}"      # counted through the API by flight_probe_all
+            else scnt="(SELECT count(*) FROM $(tbl_expr SOURCE "${SRC_T[$i]}") ${WHERE[$i]})"; fi
+            sql+="SELECT 'CNT,$i,' || $scnt || ',' || (SELECT count(*) FROM $(tbl_expr TARGET "${TGT_T[$i]}") ${WHERE[$i]});
 "
         done
         out="$(duck_run "$sql")" || die "DuckDB count failed (see the error above)"
@@ -495,10 +635,7 @@ preflight_counts() {
     local stamp; stamp="$RUN_TS"
     for i in "${!SRC_T[@]}"; do
         [[ "${SRC_CNT[$i]:-}" =~ ^[0-9]+$ && "${TGT_CNT[$i]:-}" =~ ^[0-9]+$ ]] || die "could not read the row counts for ${SRC_T[$i]}"
-        case "$LOAD_MODE" in
-            replace|stop) EXPECT[$i]="${SRC_CNT[$i]}" ;;
-            append)       EXPECT[$i]=$(( ${TGT_CNT[$i]} + ${SRC_CNT[$i]} )) ;;
-        esac
+        set_expect "$i"
         BK_NAME[$i]=""
         if [ "$BACKUP" = on ] && [ "$LOAD_MODE" = replace ] && [ "${TGT_CNT[$i]}" -gt 0 ]; then
             local suffix="_bak_$stamp" base="${TGT_T[$i]}"
@@ -572,19 +709,20 @@ write_summary() {
 }
 
 main() {
-    CONF=""; DRY_RUN=no; CHECK_ONLY=no; ASSUME_YES=no
+    CONF=""; DRY_RUN=no; CHECK_ONLY=no; ASSUME_YES=no; EXPORT_ONLY=no
     local a
     for a in "$@"; do
         case "$a" in
             --dry-run) DRY_RUN=yes ;;
             --check)   CHECK_ONLY=yes ;;
+            --export-only) EXPORT_ONLY=yes ;;
             --yes)     ASSUME_YES=yes ;;
-            -h|--help) sed -n '2,15p' "${BASH_SOURCE[0]}"; exit 0 ;;
+            -h|--help) sed -n '2,19p' "${BASH_SOURCE[0]}"; exit 0 ;;
             -*)        die "unknown option $a" ;;
             *)         CONF="$a" ;;
         esac
     done
-    [ -n "$CONF" ] || die "name the config file: ./db-import.sh [--check|--dry-run] [--yes] <config.env>"
+    [ -n "$CONF" ] || die "name the config file: ./db-import.sh [--check|--dry-run] [--export-only] [--yes] <config.env>"
     [ "${BASH_VERSINFO[0]}" -ge 4 ] || die "bash 4 or newer is required"
     load_config
     validate_config
@@ -594,20 +732,43 @@ main() {
     mkdir -p "$RUN_DIR"
     exec > >(tee -a "$RUN_DIR/run.log") 2>&1
     TMP="$(mktemp -d)"; check_re "temp folder" "$TMP" "$re_path"
-    trap 'rm -rf "$TMP"' EXIT
+    trap 'flight_cleanup; rm -rf "$TMP"' EXIT
     cp "$CONF" "$RUN_DIR/config_used.env"
+    if [ "$SOURCE_TYPE" = flightsql ]; then
+        [ -n "$EXPORT_DIR" ] || EXPORT_DIR="$RUN_DIR/export"
+        check_re EXPORT_DIR "$EXPORT_DIR" "$re_path"
+        if [ "$EXPORT_ONLY" = yes ] && [ "$EXPORT_KEEP" = no ]; then
+            warn "EXPORT_KEEP=no is ignored with --export-only: the files are the result and are kept in $EXPORT_DIR"
+            EXPORT_KEEP=yes
+        fi
+    fi
 
-    log "db-import job '$JOB_NAME'  ($SOURCE_TYPE -> $TARGET_TYPE, target env: $TARGET_ENV, engine: $ENGINE)"
+    if [ "$EXPORT_ONLY" = yes ]; then
+        log "db-import job '$JOB_NAME'  ($SOURCE_TYPE -> local parquet files, export only: no database is written)"
+    else
+        log "db-import job '$JOB_NAME'  ($SOURCE_TYPE -> $TARGET_TYPE, target env: $TARGET_ENV, engine: $ENGINE)"
+    fi
     log "period: $FROM_TS  <=  $TIME_COLUMN  <  $TO_TS   (time zone: $TIMEZONE)"
     log "mode: LOAD_MODE=$LOAD_MODE BACKUP=$BACKUP$([ "$DRY_RUN" = yes ] && echo ', DRY-RUN (rolled back at the end)')$([ "$CHECK_ONLY" = yes ] && echo ', CHECK ONLY (no change)')"
     log "report folder: $RUN_DIR"
+    if [ "$SOURCE_TYPE" = flightsql ]; then setup_flight; fi
     if [ "$ENGINE" = pg ]; then
         command -v psql >/dev/null 2>&1 || die "psql not found"
         log "psql: $(psql --version)"
+    elif [ "$EXPORT_ONLY" = yes ]; then
+        :                                   # --export-only never opens a database
     else
         setup_duck
     fi
-    [ "$BACKUP" = on ] || warn "BACKUP=off: the rows that are replaced will NOT be saved anywhere"
+    [ "$BACKUP" = on ] || [ "$EXPORT_ONLY" = yes ] || warn "BACKUP=off: the rows that are replaced will NOT be saved anywhere"
+
+    [ "$SOURCE_TYPE" != flightsql ] || flight_probe_all
+    if [ "$EXPORT_ONLY" = yes ]; then
+        [ "$CHECK_ONLY" = no ] || { log "check only: nothing was exported"; exit 0; }
+        flight_export_all
+        log "export finished: $EXPORT_DIR/<TABLE>/*.parquet. To import these files later, with no new load on the API: SOURCE_TYPE=\"parquet\" and SOURCE_PARQUET_GLOB=\"$EXPORT_DIR/{TABLE}/*.parquet\""
+        exit 0
+    fi
 
     preflight_cols
     decide_tables
@@ -615,6 +776,7 @@ main() {
     print_plan
     [ "$CHECK_ONLY" = no ] || { log "check only: nothing was changed"; exit 0; }
     confirm_target
+    if [ "$SOURCE_TYPE" = flightsql ]; then flight_export_all; fi
 
     local i failed=0
     for i in "${!SRC_T[@]}"; do

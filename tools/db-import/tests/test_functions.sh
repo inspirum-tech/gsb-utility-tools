@@ -124,6 +124,81 @@ has "duck: check uses error()"   "error('row count check failed" "$DK"
 has "duck: commit"               "COMMIT;" "$DK"
 SOURCE_TYPE=parquet; SOURCE_PARQUET_GLOB='/data/{TABLE}/*.parquet'
 has "parquet source expression"  "read_parquet('/data/KPI_X/*.parquet')" "$(tbl_expr SOURCE KPI_X)"
+echo "flightsql source (no API: a fake flight_py stands in for the helper)"
+SOURCE_TYPE=flightsql; SOURCE_HOST=localhost; SOURCE_PORT=8815; SOURCE_SCHEMA=gsb_data_kpi_pivot; EXPORT_DIR=/data/export
+unset SOURCE_PASSWORD_ENV
+eq  "flightsql: fingerprint"            "flightsql:localhost:8815" "$(side_fingerprint SOURCE)"
+has "flightsql: source expression reads the exported files" "read_parquet('/data/export/KPI_X/*.parquet')" "$(tbl_expr SOURCE KPI_X)"
+eq  "flightsql: nothing to attach"      "" "$(duck_attach SOURCE yes)"
+if (validate_side SOURCE) >/dev/null 2>&1; then ok "flightsql: a valid source is accepted"; else bad "flightsql: a valid source is accepted" "accepted" "refused"; fi
+vs_noport()   { SOURCE_PORT="";            validate_side SOURCE; }
+vs_nohost()   { SOURCE_HOST="";            validate_side SOURCE; }
+vs_noschema() { SOURCE_SCHEMA="";          validate_side SOURCE; }
+vs_badhost()  { SOURCE_HOST="a b;x";       validate_side SOURCE; }
+vs_badport()  { SOURCE_PORT="88x";         validate_side SOURCE; }
+vs_target()   { TARGET_TYPE=flightsql; TARGET_HOST=localhost; TARGET_PORT=8815; TARGET_SCHEMA=s; validate_side TARGET; }
+fails "flightsql: port required"      vs_noport
+fails "flightsql: host required"      vs_nohost
+fails "flightsql: schema required"    vs_noschema
+fails "flightsql: bad host refused"   vs_badhost
+fails "flightsql: bad port refused"   vs_badport
+fails "flightsql as a target refused" vs_target
+
+SRC_T=(KPI_X KPI_Y); TGT_T=(KPI_X KPI_Y); FROM_TS="2026-10-25 00:00:00"; TO_TS="2026-10-25 02:00:00"; TIMEZONE=Australia/Sydney
+FLIGHT_MAX_ROWS=100000; FLIGHT_TIMEOUT_SECONDS=120; FLIGHT_SLICE_MINUTES=10; FLIGHT_PAUSE_SECONDS=2; EXPORT_OVERWRITE=no; EXPORT_ONLY=no
+TIME_COLUMN=PERIOD_START_TIME; TABLE_TIME_COLUMNS="KPI_Y:period_start_time"
+flight_py() {   # fake helper: records its arguments, answers like the real one
+    printf '%s\n' "$*" >>"$T/flight_calls.txt"
+    case "$1 $*" in
+        "probe "*"--table KPI_X "*) printf 'TYPE,aware\nCOLUMN,PERIOD_START_TIME\nNCOLS,2\nSCOL,ID\nSCOL,PERIOD_START_TIME\nCOUNT,42\n' ;;
+        "probe "*)                  printf 'TYPE,naive\nCOLUMN,period_start_time\nNCOLS,1\nSCOL,period_start_time\nCOUNT,7\n' ;;
+        "export "*"--table KPI_X "*) printf 'TYPE,aware\nCOLUMN,PERIOD_START_TIME\nNCOLS,2\nSLICE,1,2,20\nSLICE,2,2,22\nTOTAL,42\n' ;;
+        "export "*)                 printf 'TYPE,naive\nSLICE,1,1,9\nTOTAL,9\n' ;;
+    esac
+}
+TMP="$T"; : >"$T/flight_calls.txt"
+flight_probe_all >"$T/probe.out" 2>&1
+eq  "probe: row count of table 1"       "42" "${SRC_CNT[0]}"
+eq  "probe: row count of table 2"       "7"  "${SRC_CNT[1]}"
+eq  "probe: kind of table 1"            "aware" "${FL_KIND[0]}"
+eq  "probe: kind of table 2"            "naive" "${FL_KIND[1]}"
+eq  "probe: real time column name"      "period_start_time" "${FL_COL[1]}"
+eq  "probe: column list of table 1"     "$(printf 'ID\nPERIOD_START_TIME\n')" "$(printf '%s' "${SRC_COLS[0]}")"
+has "probe: time column from TABLE_TIME_COLUMNS is passed" "--table KPI_Y --time-column period_start_time" "$(cat "$T/flight_calls.txt")"
+has "probe: window and time zone are passed" '--from-local 2026-10-25 00:00:00 --to-local 2026-10-25 02:00:00 --timezone Australia/Sydney' "$(cat "$T/flight_calls.txt")"
+has "probe: row cap and timeout are passed" '--max-rows 100000 --timeout-seconds 120' "$(cat "$T/flight_calls.txt")"
+TC=(); tc0="$(tcol_for KPI_X)"; [ -z "${FL_COL[0]:-}" ] || tc0="${FL_COL[0]}"
+eq  "decide: the probe's column name wins" "PERIOD_START_TIME" "$tc0"
+
+# the data changed between the count and the export: the exported total is used and the expectation follows
+TGT_CNT=(5 5); LOAD_MODE=replace; set_expect 0; eq "set_expect replace" "42" "${EXPECT[0]}"
+LOAD_MODE=append;  set_expect 0; eq "set_expect append"  "47" "${EXPECT[0]}"
+LOAD_MODE=replace
+: >"$T/flight_calls.txt"
+flight_export_all >"$T/export.out" 2>&1; OUT="$(cat "$T/export.out")"
+has "export: slice progress is shown" "slice 2,2,22" "$OUT"
+has "export: slice size, pause and output folder are passed" "--slice-minutes 10 --pause-seconds 2" "$(cat "$T/flight_calls.txt")"
+hasnt "export: no --overwrite by default" "--overwrite" "$(cat "$T/flight_calls.txt")"
+eq  "export: total equals the count, no warning" "42" "${SRC_CNT[0]}"
+eq  "export: table 2 total replaces the count"   "9"  "${SRC_CNT[1]}"
+eq  "export: expectation follows the new total"  "9"  "${EXPECT[1]}"
+has "export: warns when the data changed" "the earlier count said 7" "$OUT"
+EXPORT_OVERWRITE=yes; : >"$T/flight_calls.txt"; flight_export_all >/dev/null 2>&1
+has "export: --overwrite only when asked" "--overwrite" "$(cat "$T/flight_calls.txt")"
+EXPORT_OVERWRITE=no
+
+# EXPORT_KEEP
+X="$(mktemp -d)"; EXPORT_DIR="$X/exp"; mkdir -p "$EXPORT_DIR/KPI_X" "$EXPORT_DIR/KPI_Y" "$EXPORT_DIR/KEEP_ME"; : >"$EXPORT_DIR/KPI_X/a.parquet"
+FL_EXPORTED=" KPI_X KPI_Y"
+EXPORT_KEEP=yes; flight_cleanup
+if [ -d "$EXPORT_DIR/KPI_X" ]; then ok "EXPORT_KEEP=yes keeps the files"; else bad "EXPORT_KEEP=yes keeps the files" "kept" "removed"; fi
+EXPORT_KEEP=no; flight_cleanup
+if [ ! -e "$EXPORT_DIR/KPI_X" ] && [ ! -e "$EXPORT_DIR/KPI_Y" ]; then ok "EXPORT_KEEP=no removes the exported tables"; else bad "EXPORT_KEEP=no removes the exported tables" "removed" "still there"; fi
+if [ -d "$EXPORT_DIR/KEEP_ME" ]; then ok "EXPORT_KEEP=no leaves other folders alone"; else bad "EXPORT_KEEP=no leaves other folders alone" "kept" "removed"; fi
+rm -rf "$X"
+unset -f flight_py
+SOURCE_TYPE=parquet
+
 rm -rf "$T"
 
 echo

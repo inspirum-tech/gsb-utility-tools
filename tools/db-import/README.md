@@ -7,6 +7,7 @@ with the other tools in this repository.
 
 **To run it on uat / prod follow [RUNBOOK.md](RUNBOOK.md)** (step by step, no other help needed).
 Status and decisions: [PLAN.md](PLAN.md), open items: [parking-lot.md](parking-lot.md), what was tested: [docs/EVIDENCE.md](docs/EVIDENCE.md).
+The Flight SQL source (prod API to UAT through a tunnel): [PLAN-FLIGHTSQL.md](PLAN-FLIGHTSQL.md).
 
 ## Quick start
 
@@ -37,9 +38,10 @@ match, the table is rolled back and nothing is left behind (not even the backup)
 |---|---|---|
 | Postgres -> Postgres | `psql` only. The target `psql` runs the source `psql` as a program and streams the rows (csv), no file | bash 4+, psql |
 | anything with DuckDB / DuckLake / parquet | the DuckDB CLI, extensions from `bundle/` | bash 4+, `bundle/` (it holds the DuckDB binary) |
+| source `flightsql` (the gsb-kpi-data-api, read in small time slices; used when the source's data files cannot be reached, e.g. prod from UAT through a tunnel) | `flightsql_export.py` (Python) saves the slices as parquet files, then the DuckDB engine imports them | the above, plus `python3` and `bundle/pylibs` |
 
 You never choose the engine: `SOURCE_TYPE` and `TARGET_TYPE` in the config decide.
-Source types: `postgres`, `duckdb` (file), `ducklake`, `parquet`. Target types: `postgres`, `duckdb`, `ducklake`.
+Source types: `postgres`, `duckdb` (file), `ducklake`, `parquet`, `flightsql`. Target types: `postgres`, `duckdb`, `ducklake`.
 
 ## Offline (uat / prod have no internet)
 
@@ -56,6 +58,9 @@ download anything, so the extensions travel with the tool. Only needed when Duck
    It never tries to download anything. `OFFLINE="no"` is for dev only.
 
 Postgres -> Postgres needs no bundle.
+
+A `flightsql` source also needs Python packages (pyarrow, adbc-driver-flightsql): build them once on a machine with internet with `./prepare-bundle.sh --tar --with-flightsql`
+(the same Python minor version as the server that will run the tool; they land in `bundle/pylibs`). Details: RUNBOOK section 3.5.
 
 ## Config
 
@@ -74,6 +79,7 @@ Everything is in the config file; [config.example.env](config.example.env) docum
 | `BACKUP` | `on` (default) or `off`. On = the replaced rows are saved in `BACKUP_SCHEMA."<table>_bak_<date_time>"` in the target database. Off = no backup, a warning is printed |
 | `ON_ERROR` | `stop` (default) or `continue` with the next table |
 | `OFFLINE` | `yes` (default) or `no` |
+| `FLIGHT_*`, `EXPORT_*`, `PYTHON` | only for `SOURCE_TYPE="flightsql"`: row cap, slice size, pause, where the exported files go and whether they are kept. See RUNBOOK section 3.5 |
 
 ## Safety checks (before anything is written)
 
@@ -110,4 +116,5 @@ DuckDB on dev reads `~/.duckdbrc`; the script starts DuckDB with `-init /dev/nul
 
 - `bash tests/test_functions.sh`: the logic (periods, quoting, config rules, the generated SQL). No database needed.
 - `bash tests/dev_scratch_test.sh`: Postgres -> Postgres on dev with scratch schemas it creates and drops itself.
-- DuckDB / DuckLake paths and the offline bundle: see `docs/EVIDENCE.md` for what has and has not been run.
+- `python3 tests/test_flightsql_export.py`: the logic of the Flight SQL helper (time slices, filters, daylight saving). No API needed.
+- DuckDB / DuckLake paths and the offline bundle: see `docs/EVIDENCE.md` for what has and has not been run. The Flight SQL source: [PLAN-FLIGHTSQL.md](PLAN-FLIGHTSQL.md) (plan, decisions, evidence).
