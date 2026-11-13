@@ -35,7 +35,7 @@ opt_path()    { [ -z "${!1:-}" ] || need_path "$1"; }
 need_regex()  { case "${!1:-}" in ''|*\'*|*\"*|*\;*|*--*|*$'\n'*) die "$1 must be a regular expression without quotes, ; or --";; esac; }
 
 MODE="${MODE:-manual}"
-case "$MODE" in manual|auto) ;; *) die "MODE must be manual or auto";; esac
+case "$MODE" in manual|auto|list) ;; *) die "MODE must be manual, auto or list";; esac
 need_ts PERIOD_FROM; need_ts PERIOD_TO
 for v in TOLERANCE_ABS TOLERANCE_REL FLOAT_SLACK; do need_number "$v"; done
 need_signed SPECIAL_DEFAULT
@@ -48,6 +48,22 @@ opt_path KPI_LIST_FILE; opt_path KPI_MAP_FILE; need_path REPORT_DIR; opt_path TE
 [ -z "${KPI_LIST_FILE}" ] || [ -f "$KPI_LIST_FILE" ] || die "KPI_LIST_FILE not found: $KPI_LIST_FILE"
 [ -z "${KPI_MAP_FILE}" ] || [ -f "$KPI_MAP_FILE" ] || die "KPI_MAP_FILE not found: $KPI_MAP_FILE"
 command -v "$DUCKDB" >/dev/null 2>&1 || [ -x "$DUCKDB" ] || die "DuckDB CLI not found (DUCKDB=$DUCKDB)"
+
+# info columns (labels such as SITE_NAME, CELL_NAME): compared and reported separately, never part of the KPI verdict
+INFO_COMPARE="${INFO_COMPARE:-no}"; INFO_COLS="${INFO_COLS:-}"; INFO_SELECT=""; INFO_ON=""
+need_yesno INFO_COMPARE
+build_info() {  # builds the SQL pieces of INFO_COLS (called at start and again for every line of a pairs file)
+  INFO_SELECT=""; INFO_ON=""
+  [ "$INFO_COMPARE" = yes ] || return 0
+  [[ "$INFO_COLS" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || die "INFO_COLS must be column names separated by commas"
+  local IFS_SAVE="$IFS" c; IFS=','
+  for c in $INFO_COLS; do
+    INFO_SELECT+="${INFO_SELECT:+, }coalesce(CAST(\"$c\" AS VARCHAR), '~~NULL~~') AS \"$c\""
+    INFO_ON+="${INFO_ON:+, }\"$c\""
+  done
+  IFS="$IFS_SAVE"
+}
+build_info
 
 if [ "$MODE" = auto ]; then
   [[ "${AUTO_APPLICATIONS:-}" =~ ^(ALL|[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*)$ ]] || die "AUTO_APPLICATIONS must be ALL or application names separated by commas (letters, digits, _)"
@@ -71,6 +87,20 @@ dsn_of() {  # $1 = name of the variable or the ENV_FILE key
   printf '%s' "$dsn"
 }
 
+# The DuckDB "postgres" extension is needed to read a Postgres source. Try LOAD first (works with no
+# internet when the extension is already on this machine); INSTALL (a download) only when LOAD fails.
+# If both fail we stop here with one clear message, not in the middle of a run.
+PG_EXT_OK=no
+ensure_pg_ext() {
+  [ "$PG_EXT_OK" = yes ] && return 0
+  if "$DUCKDB" -c "LOAD postgres;" >/dev/null 2>&1; then :
+  elif "$DUCKDB" -c "INSTALL postgres; LOAD postgres;" >/dev/null 2>&1; then :
+  else
+    die "the DuckDB 'postgres' extension is not on this machine and could not be downloaded (no internet?). Copy it once from a machine that has it: ~/.duckdb/extensions/<duckdb version>/<platform>/postgres_scanner.duckdb_extension to the same folder for this user (see README, 'Offline servers')"
+  fi
+  PG_EXT_OK=yes
+}
+
 attach_source() {  # $1 = OLD, NEW or DEF; sets ALIAS (the catalog name to use in SQL)
   local P="$1" side src key v
   side="$(echo "$P" | tr 'A-Z' 'a-z')"
@@ -89,8 +119,8 @@ attach_source() {  # $1 = OLD, NEW or DEF; sets ALIAS (the catalog name to use i
     *)
       case "$src" in
         postgres)
-          ALIAS="cmp_pg_$side"; local dsn; dsn="$(dsn_of "$envname")"
-          ATTACH_SQL+="INSTALL postgres; LOAD postgres;"$'\n'"ATTACH '${dsn//\'/\'\'}' AS ${ALIAS} (TYPE postgres, READ_ONLY);"$'\n' ;;
+          ALIAS="cmp_pg_$side"; local dsn; dsn="$(dsn_of "$envname")"; ensure_pg_ext
+          ATTACH_SQL+="LOAD postgres;"$'\n'"ATTACH '${dsn//\'/\'\'}' AS ${ALIAS} (TYPE postgres, READ_ONLY);"$'\n' ;;
         duckdb)   ALIAS="cmp_db_$side"; ATTACH_SQL+="ATTACH '${f}' AS ${ALIAS} (READ_ONLY);"$'\n' ;;
         attached) ALIAS="$c" ;;
       esac
@@ -122,6 +152,13 @@ prep_side() {  # $1 = OLD or NEW
     kexpr+="coalesce(CAST(\"$col\" AS VARCHAR), '<NULL>')"
   done
   IFS="$IFS_OLD"
+  # optional: rewrite the key text with a regex (RE2, \1 for a group) so keys that differ only in format can match,
+  # e.g. NEW_KEY_REGEX_FROM='Inner-(.*)-X$' NEW_KEY_REGEX_TO='Inner_\1'. A key that does not match is left unchanged.
+  local krf krt; krf="$(v KEY_REGEX_FROM)"; krt="$(v KEY_REGEX_TO)"
+  if [ -n "$krf" ]; then
+    case "$krf$krt" in *$'\n'*) die "${P}_KEY_REGEX_FROM/TO must be one line";; esac
+    kexpr="regexp_replace(${kexpr}, '${krf//\'/\'\'}', '${krt//\'/\'\'}')"
+  fi
   NKEYS_COUNT="$(printf '%s' "$keys" | tr ',' '\n' | wc -l | tr -d ' ')"
 
   # period: normalised to a timestamptz (UTC instant); the window test is on the raw column so it can be pushed down
@@ -141,6 +178,12 @@ prep_side() {  # $1 = OLD or NEW
     [[ "$fc" =~ ^[A-Za-z0-9_]+$ ]] || die "${P}_FILTER_COL must be a column name"
     case "$fv" in *$'\n'*) die "${P}_FILTER_VALUE must be one line";; esac
     FILTER_SQL=" AND \"$fc\" = '${fv//\'/\'\'}'"
+  fi
+
+  if [ "$INFO_COMPARE" = yes ] && [ "$shape" = wide ]; then
+    INFO_SIDE_SQL="CREATE OR REPLACE TEMP TABLE ${side}_info AS SELECT p_utc, k, col, max(val) AS val FROM (SELECT __p AS p_utc, __k AS k, col, nullif(val, '~~NULL~~') AS val FROM (UNPIVOT (SELECT __p, __k, ${INFO_SELECT} FROM ${side}_src) ON ${INFO_ON} INTO NAME col VALUE val)) GROUP BY 1, 2, 3;"
+  else
+    INFO_SIDE_SQL="CREATE OR REPLACE TEMP TABLE ${side}_info AS SELECT CAST(NULL AS TIMESTAMPTZ) AS p_utc, CAST(NULL AS VARCHAR) AS k, CAST(NULL AS VARCHAR) AS col, CAST(NULL AS VARCHAR) AS val WHERE false;"
   fi
 
   SIDE="$side"; REF="${alias}.\"$schema\".\"$table\""; K_EXPR="$kexpr"; PER_COL="\"$pcol\""
@@ -209,11 +252,16 @@ UPDATE new_cols SET kpi = m.old_kpi FROM kpimap m WHERE new_cols.kpi = m.new_kpi
   fi
   export KPI_MAP_SQL KPI_ALLOWED_SELECT DUP_THRESHOLD_OLD DUP_THRESHOLD_NEW
   SQL_BODY+="$(render sql/20_compare.sql)"$'\n'
+  [ "$INFO_COMPARE" != yes ] || SQL_BODY+="$(render sql/25_info.sql)"$'\n'
   SQL_BODY+="$(render sql/30_report.sql)"$'\n'
 
   mkdir -p "$REPORT_DIR"
   printf '%s' "$SQL_BODY" > "$REPORT_DIR/generated.sql"   # no connection strings in it
   cp "$CONFIG" "$REPORT_DIR/config_used.env"
+  # list and auto mode override some settings per table; record the values this table really used (the last line wins)
+  { printf '\n# ---- effective values for this table (list / auto mode override the lines above) ----\n'
+    for ev in OLD_TABLE NEW_TABLE OLD_KEY_COLS NEW_KEY_COLS INFO_COMPARE INFO_COLS; do printf '%s=%s\n' "$ev" "${!ev-}"; done
+  } >> "$REPORT_DIR/config_used.env"
   local T; T="$(mktemp -d)"; chmod 700 "$T"
   printf '%s\n%s\n%s' "$ATTACH_SQL" "$(duck_settings)" "$SQL_BODY" > "$T/run.sql"
 
@@ -238,11 +286,153 @@ UPDATE new_cols SET kpi = m.old_kpi FROM kpimap m WHERE new_cols.kpi = m.new_kpi
   esac
 }
 
+# ---- CM comparison (CM_COMPARE=yes): the CM table of the old side against the CM table of the new side -------
+CM_COMPARE="${CM_COMPARE:-no}"
+CM_FAIL_ON_OBJECTS_ONE_SIDE="${CM_FAIL_ON_OBJECTS_ONE_SIDE:-yes}"
+CM_FAIL_ON_COLUMNS_ONE_SIDE="${CM_FAIL_ON_COLUMNS_ONE_SIDE:-no}"
+need_yesno CM_COMPARE
+
+run_cm() {  # $1 = folder for the CM report files; returns 0 IDENTICAL, 1 DIFFERENT, 3 NOT COMPARABLE, 2 error
+  local CM_REPORT_DIR="$1" P col IFS_OLD="$IFS" skip excl=""
+  need_yesno CM_FAIL_ON_OBJECTS_ONE_SIDE; need_yesno CM_FAIL_ON_COLUMNS_ONE_SIDE
+  [[ "${CM_KEY_COLS:-}" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || die "CM_KEY_COLS must be names separated by commas"
+  [ -z "${CM_EXCLUDE_COLS:-}" ] || [[ "$CM_EXCLUDE_COLS" =~ ^[A-Za-z0-9_]+(,[A-Za-z0-9_]+)*$ ]] || die "CM_EXCLUDE_COLS must be names separated by commas"
+  opt_ident CM_ASOF_COL
+  [ -z "${CM_ASOF_COL:-}" ] || [[ "${CM_ASOF_TZ:-}" =~ ^[A-Za-z0-9_/+-]+$ ]] || die "CM_ASOF_TZ must be a time zone name"
+
+  CM_K_EXPR=""; IFS=','
+  for col in $CM_KEY_COLS; do
+    [ -z "$CM_K_EXPR" ] || CM_K_EXPR+=" || '|' || "
+    CM_K_EXPR+="coalesce(CAST(\"$col\" AS VARCHAR), '<NULL>')"
+  done
+  # columns that are never compared: internal helper columns, key columns, the as-of column, CM_EXCLUDE_COLS (each once)
+  for col in __k __a __n $CM_KEY_COLS ${CM_ASOF_COL:-} ${CM_EXCLUDE_COLS:-}; do
+    case ",$excl," in *",\"$col\","*) continue;; esac
+    excl+="${excl:+,}\"$col\""
+  done
+  IFS="$IFS_OLD"
+  CM_EXCLUDE_SQL="$excl"
+
+  ATTACH_SQL=""; ATTACHED_KEYS=""
+  local ref schema table sv tv
+  for P in CM_OLD CM_NEW; do
+    sv="${P}_SCHEMA"; tv="${P}_TABLE"; schema="${!sv:-main}"; table="${!tv:-}"
+    for col in "$schema" "$table"; do [[ "$col" =~ ^[A-Za-z0-9_]+$ ]] || die "${P}: schema and table must be letters, digits, _ only"; done
+    attach_source "$P"; ref="${ALIAS}.\"${schema}\".\"${table}\""
+    if [ -n "${CM_ASOF_COL:-}" ]; then
+      printf -v "${P}_A_EXPR" '%s' "\"${CM_ASOF_COL}\""
+      printf -v "${P}_WHERE" '%s' "WHERE \"${CM_ASOF_COL}\" <= (TIMESTAMPTZ '${PERIOD_TO}' AT TIME ZONE '${CM_ASOF_TZ}')"
+    else
+      printf -v "${P}_A_EXPR" '%s' "NULL"; printf -v "${P}_WHERE" '%s' ""
+    fi
+    printf -v "${P}_REF" '%s' "$ref"; printf -v "${P}_K_EXPR" '%s' "$CM_K_EXPR"
+  done
+
+  local SQL_BODY; SQL_BODY="$(render sql/40_cm.sql)"
+  mkdir -p "$CM_REPORT_DIR"
+  printf '%s' "$SQL_BODY" > "$CM_REPORT_DIR/generated_cm.sql"   # no connection strings in it
+  local T; T="$(mktemp -d)"; chmod 700 "$T"
+  printf '%s\n%s\n%s' "$ATTACH_SQL" "$(duck_settings)" "$SQL_BODY" > "$T/run.sql"
+  rm -f "$CM_REPORT_DIR/cm_verdict.txt"
+  local rc=0
+  "$DUCKDB" -bail -f "$T/run.sql" || rc=$?
+  rm -rf "$T"
+  [ "$rc" -eq 0 ] || { echo "the CM comparison stopped with an error; nothing was written to the sources" >&2; return 2; }
+  [ -s "$CM_REPORT_DIR/cm_verdict.txt" ] || die "no CM verdict was written"
+  case "$(cut -d: -f1 "$CM_REPORT_DIR/cm_verdict.txt")" in
+    IDENTICAL) return 0 ;; DIFFERENT) return 1 ;; "NOT COMPARABLE") return 3 ;; *) return 2 ;;
+  esac
+}
+
+# ---- final output (FINAL_REPORT=yes, list mode): Word report + Excel sheets built from the report folder -----------
+# Optional and read only: it reads REPORT_DIR and writes a NEW folder. A failure here only prints a message; the exit code is
+# never changed by it. Needs python3 (standard library only, nothing to install). See scripts/make_final_report.py.
+FINAL_REPORT="${FINAL_REPORT:-no}"; need_yesno FINAL_REPORT
+make_final_report() {
+  local PY out args=()
+  PY="$(command -v python3 || command -v python || true)"
+  if [ -z "$PY" ]; then echo "final report skipped: python3 was not found (the comparison itself is complete)" >&2; return 0; fi
+  out="${FINAL_REPORT_DIR:-${REPORT_DIR%/}_FINAL_OUTPUT_RESULT}"
+  need_path out
+  local t="${FINAL_REPORT_TITLE:-NS Pivot Comparison}" a="${FINAL_REPORT_AUTHOR:-}"
+  [[ "$t" =~ ^[A-Za-z0-9\ _-]+$ ]] || die "FINAL_REPORT_TITLE may hold letters, digits, space, _ and - only"
+  [[ "$a" =~ ^[A-Za-z0-9\ ._-]*$ ]] || die "FINAL_REPORT_AUTHOR may hold letters, digits, space, . _ and - only"
+  args=(--title "$t" --author "$a")
+  local v f
+  for v in NOTES COMMENTS FINGERPRINT; do
+    f="FINAL_REPORT_${v}_FILE"; opt_path "$f"
+    if [ -n "${!f:-}" ]; then
+      [ -f "${!f}" ] || die "$f not found: ${!f}"
+      args+=("--$(echo "$v" | tr 'A-Z' 'a-z')" "${!f}")
+    fi
+  done
+  "$PY" "$TOOL_DIR/scripts/make_final_report.py" "$REPORT_DIR" "$out" "${args[@]}" \
+    || echo "final report was not written (see the message above); the comparison itself is complete" >&2
+  return 0
+}
+
+combine_rc() {  # $1 = KPI result code, $2 = CM result code -> overall exit code (a CM difference makes the run DIFFERENT)
+  if [ "$1" -eq 2 ] || [ "$2" -eq 2 ]; then echo 2
+  elif [ "$1" -eq 1 ] || [ "$2" -eq 1 ]; then echo 1
+  elif [ "$1" -eq 3 ] || [ "$2" -eq 3 ]; then echo 3
+  else echo 0; fi
+}
+
 # ---- manual mode ------------------------------------------------------------------------------------
 if [ "$MODE" = manual ]; then
   FAMILY_TABLE=""
   rc=0; run_one || rc=$?
+  if [ "$CM_COMPARE" = yes ]; then
+    echo; echo "pivot-compare: CM comparison ${CM_OLD_SCHEMA}.${CM_OLD_TABLE} against ${CM_NEW_SCHEMA}.${CM_NEW_TABLE}"
+    cmrc=0; run_cm "$REPORT_DIR/cm" || cmrc=$?
+    rc="$(combine_rc "$rc" "$cmrc")"
+  fi
   exit "$rc"
+fi
+
+# ---- list mode: the table pairs come from PAIRS_FILE (one comparison per line, one report folder per line) ----
+# PAIRS_FILE is a CSV with the header  name,old_table,new_table,key_cols,info_cols  ; lists inside a field use ; (SITE_ID;CELL_ID).
+# Everything else (sources, schemas, period, tolerance ...) comes from this config and is the same for every line.
+if [ "$MODE" = list ]; then
+  PAIRS_FILE="${PAIRS_FILE:-}"; need_path PAIRS_FILE; [ -f "$PAIRS_FILE" ] || die "PAIRS_FILE not found: $PAIRS_FILE"
+  BASE="$REPORT_DIR"; mkdir -p "$BASE"
+  echo "pivot-compare (list): $(($(wc -l < "$PAIRS_FILE") - 1)) table pairs from $PAIRS_FILE"
+  echo "period (UTC): $PERIOD_FROM  to  $PERIOD_TO     report folder: $BASE"
+  SUMMARY="$BASE/pairs_summary.csv"; echo "name,result,detail" > "$SUMMARY"
+  N_RUN=0; N_DIFF=0; N_NC=0; N_ERR=0; N_IDENT=0
+  while IFS=',' read -r name oldtbl newtbl keys infocols <&3; do
+    name="${name//[$'\r\n ']/}"; [ -n "$name" ] || continue
+    oldtbl="${oldtbl//[$'\r\n ']/}"; newtbl="${newtbl//[$'\r\n ']/}"; keys="${keys//[$'\r\n ']/}"; infocols="${infocols//[$'\r\n ']/}"
+    [[ "$name" =~ ^[A-Za-z0-9_]+$ ]] || die "pairs file: name '$name' must be letters, digits and _ only"
+    N_RUN=$((N_RUN+1))
+    set +e
+    ( set -e
+      FAMILY_TABLE=""; OLD_TABLE="$oldtbl"; NEW_TABLE="$newtbl"; REPORT_DIR="$BASE/$name"
+      OLD_KEY_COLS="${keys//;/,}"; NEW_KEY_COLS="${keys//;/,}"
+      if [ -n "$infocols" ]; then INFO_COLS="${infocols//;/,}"; INFO_COMPARE=yes; fi
+      build_info
+      run_one > "$BASE/$name.screen.txt" 2>&1 ) < /dev/null
+    rc=$?
+    set -e
+    detail="$( [ -s "$BASE/$name/verdict.txt" ] && cat "$BASE/$name/verdict.txt" || echo "no verdict (see $BASE/$name.screen.txt)" )"
+    case "$rc" in
+      0) res=IDENTICAL; N_IDENT=$((N_IDENT+1)) ;; 1) res=DIFFERENT; N_DIFF=$((N_DIFF+1)) ;; 3) res="NOT COMPARABLE"; N_NC=$((N_NC+1)) ;;
+      *) res=ERROR; N_ERR=$((N_ERR+1)) ;;
+    esac
+    printf '%s,%s,"%s"\n' "$name" "$res" "${detail//\"/\'}" >> "$SUMMARY"
+    printf '  %-16s %s\n' "$name" "$res"
+    printf '      %s\n' "$detail" | cut -c1-260
+  done 3< <(tail -n +2 "$PAIRS_FILE")   # the first line is the header
+  echo
+  echo "pairs: $N_RUN   identical: $N_IDENT   different: $N_DIFF   not comparable: $N_NC   errors: $N_ERR"
+  echo "summary: $SUMMARY     details per pair: $BASE/<name>/"
+  if [ "$FINAL_REPORT" = yes ]; then   # in a subshell: a wrong FINAL_REPORT_* setting stops only the report, never the result
+    ( REPORT_DIR="$BASE"; make_final_report ) || echo "final report not written (see the message above); the comparison itself is complete" >&2
+  fi
+  if [ "$N_ERR" -gt 0 ]; then exit 2
+  elif [ "$N_DIFF" -gt 0 ]; then exit 1
+  elif [ "$N_RUN" -eq 0 ] || [ "$N_NC" -gt 0 ]; then exit 3
+  else exit 0; fi
 fi
 
 # ---- auto mode: find the families from the KPI definitions, compare each one ----------------------------
@@ -297,7 +487,13 @@ done 3< "$BASE/families.txt"
 echo
 echo "families found: $N_FAM   compared: $N_RUN   skipped (no old table): $N_SKIP   different: $N_DIFF   not comparable: $N_NC   errors: $N_ERR"
 echo "summary: $SUMMARY     details per family: $BASE/<family>/"
-if [ "$N_ERR" -gt 0 ]; then exit 2
-elif [ "$N_DIFF" -gt 0 ]; then exit 1
-elif [ "$N_RUN" -eq 0 ] || [ "$N_NC" -gt 0 ]; then exit 3
-else exit 0; fi
+if [ "$N_ERR" -gt 0 ]; then rc=2
+elif [ "$N_DIFF" -gt 0 ]; then rc=1
+elif [ "$N_RUN" -eq 0 ] || [ "$N_NC" -gt 0 ]; then rc=3
+else rc=0; fi
+if [ "$CM_COMPARE" = yes ]; then
+  echo; echo "pivot-compare: CM comparison ${CM_OLD_SCHEMA}.${CM_OLD_TABLE} against ${CM_NEW_SCHEMA}.${CM_NEW_TABLE}"
+  cmrc=0; run_cm "$BASE/cm" || cmrc=$?
+  rc="$(combine_rc "$rc" "$cmrc")"
+fi
+exit "$rc"

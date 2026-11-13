@@ -20,4 +20,7 @@ FROM ${SIDE}_src
 WHERE __v IS NOT NULL AND regexp_matches(__kpi, '${SIDE_KPI_REGEX}')
 GROUP BY 1, 2, 3;
 
+-- a tall source has no info columns: ${SIDE}_info stays empty
+${INFO_SIDE_SQL}
+
 DROP TABLE ${SIDE}_src;

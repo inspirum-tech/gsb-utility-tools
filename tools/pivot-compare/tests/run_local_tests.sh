@@ -11,6 +11,9 @@ W=tests/work
 rm -rf "$W"; mkdir -p "$W"
 "$DUCKDB" "$W/old.duckdb" < tests/make_fake_data.sql >/dev/null || { echo "could not build the fake OLD data" >&2; exit 2; }
 "$DUCKDB" "$W/new.duckdb" < tests/make_fake_data_new.sql >/dev/null || { echo "could not build the fake NEW data" >&2; exit 2; }
+"$DUCKDB" "$W/info.duckdb" < tests/make_fake_info.sql >/dev/null || { echo "could not build the fake info data" >&2; exit 2; }
+"$DUCKDB" "$W/cm_old.duckdb" < tests/make_fake_cm_old.sql >/dev/null || { echo "could not build the fake OLD CM data" >&2; exit 2; }
+"$DUCKDB" "$W/cm_new.duckdb" < tests/make_fake_cm_new.sql >/dev/null || { echo "could not build the fake NEW CM data" >&2; exit 2; }
 
 PASS=0; FAIL=0
 check() {  # name, expected, actual
@@ -18,6 +21,8 @@ check() {  # name, expected, actual
   else FAIL=$((FAIL+1)); echo "  FAIL  $1: expected '$2', got '$3'"; fi
 }
 metric() { "$DUCKDB" -csv -noheader -c "SELECT value FROM read_csv('$1/summary.csv') WHERE metric = '$2'"; }
+cmmetric() { "$DUCKDB" -csv -noheader -c "SELECT value FROM read_csv('$1/cm_summary.csv') WHERE metric = '$2'"; }
+infometric() { "$DUCKDB" -csv -noheader -c "SELECT value FROM read_csv('$1/info_summary.csv') WHERE metric = '$2'"; }
 rows()   { "$DUCKDB" -csv -noheader -c "SELECT count(*) FROM read_csv('$1')"; }
 # variant NAME 'KEY=value' ...  : the test config plus overrides (a later line wins when the file is read)
 variant() { local n="$1"; shift; { cat tests/test.env; for o in "$@"; do echo "$o"; done; echo "REPORT_DIR=$W/report_$n"; } > "$W/$n.env"; }
@@ -110,6 +115,134 @@ check "LTE: values different" 1 "$(metric $RL values_different)"
 check "LTE: NULL in old only" 1 "$(metric $RL values_null_old_only)"
 check "LTE: KPI columns only in new (other family's K_8 is not counted)" 0 "$(metric $RL only_new_kpi_columns)"
 check "5G: objects only in old and new" 0 "$(( $(metric $R/KPI_APP_TEST_QRLY_CELL_5G_ERS_P only_old_objects) + $(metric $R/KPI_APP_TEST_QRLY_CELL_5G_ERS_P only_new_objects) ))"
+
+echo "J. CM comparison switched off: no CM folder is written"
+check "no cm folder in the report of test A (CM_COMPARE is not set)" 0 "$([ -d "$W/report_A/cm" ] && echo 1 || echo 0)"
+
+echo "K. CM comparison switched on (history: the row in force at PERIOD_TO is used)"
+CMCFG=(CM_COMPARE=yes CM_OLD_SOURCE=duckdb CM_OLD_DSN_ENV= CM_OLD_DB_FILE=$W/cm_old.duckdb CM_OLD_SCHEMA=main CM_OLD_TABLE=CM_TEST
+  CM_NEW_SOURCE=duckdb CM_NEW_DSN_ENV= CM_NEW_DB_FILE=$W/cm_new.duckdb CM_NEW_SCHEMA=main CM_NEW_TABLE=CM_TEST
+  CM_KEY_COLS=CELL_NAME CM_ASOF_COL=INSERT_DT CM_ASOF_TZ=Australia/Sydney CM_EXCLUDE_COLS=)
+variant K "${CMCFG[@]}" 'PERIOD_FROM="2025-12-19 09:00:00+00"'
+code=$(run K); R=$W/report_K/cm
+check "exit code (1 = DIFFERENT)" 1 "$code"
+check "CM verdict starts with" DIFFERENT "$(cut -d: -f1 "$R/cm_verdict.txt")"
+check "CM objects in old" 4 "$(cmmetric $R old_objects)"
+check "CM objects in new" 4 "$(cmmetric $R new_objects)"
+check "CM objects in both" 3 "$(cmmetric $R common_objects)"
+check "CM objects only in old (D)" 1 "$(cmmetric $R only_old_objects)"
+check "CM objects only in new (E)" 1 "$(cmmetric $R only_new_objects)"
+check "CM columns in both (BW, STATE, FREQ; not the key or the as-of column)" 3 "$(cmmetric $R common_columns)"
+check "CM columns only in old" 1 "$(cmmetric $R only_old_columns)"
+check "CM columns only in new" 1 "$(cmmetric $R only_new_columns)"
+check "CM values compared" 9 "$(cmmetric $R values_compared)"
+check "CM values equal (A's 1e-9 and the later CM row ignored)" 7 "$(cmmetric $R values_equal)"
+check "CM values different" 1 "$(cmmetric $R values_different)"
+check "CM NULL in old only" 1 "$(cmmetric $R values_null_old_only)"
+check "CM objects with several rows after the as-of cut" 0 "$(cmmetric $R objects_with_several_rows)"
+check "the wrong value is BW of B (10 against 15)" "B,BW,10.0,15.0" \
+  "$("$DUCKDB" -csv -noheader -c "SELECT object_key, cm_column, old_value, new_value FROM read_csv('$R/cm_differences.csv') WHERE kind = 'DIFF'")"
+
+echo "L. CM comparison without a history column: both rows of A count as several rows"
+variant L "${CMCFG[@]}" CM_ASOF_COL=
+code=$(run L); R=$W/report_L/cm
+check "CM objects with several rows" 2 "$(cmmetric $R objects_with_several_rows)"
+
+echo "M. a bad CM key column name is refused"
+variant M "${CMCFG[@]}" 'CM_KEY_COLS="CELL_NAME;drop"'
+code=$(run M)
+check "exit code (2 = bad setup)" 2 "$code"
+
+echo "N. info columns: compared and reported separately, the KPI verdict is not changed"
+INFOCFG=(INFO_COMPARE=yes INFO_COLS=SITE_NAME,CELL_NAME,LAC,TAC OLD_DB_FILE=$W/info.duckdb OLD_TABLE=info_old
+  NEW_DB_FILE=$W/info.duckdb NEW_TABLE=info_new NEW_SHAPE=wide NEW_FILTER_COL= NEW_FILTER_VALUE=
+  FAIL_ON_OBJECTS_ONE_SIDE=no FAIL_ON_KPI_COLUMNS_ONE_SIDE=no)
+variant N "${INFOCFG[@]}"
+code=$(run N); R=$W/report_N
+check "exit code stays 0 (KPI values are IDENTICAL although the info columns differ)" 0 "$code"
+check "KPI verdict starts with" IDENTICAL "$(cut -d: -f1 "$R/verdict.txt")"
+check "info verdict starts with" DIFFERENT "$(cut -d: -f1 "$R/info_verdict.txt")"
+check "info objects compared (the object only in new is not one)" 3 "$(infometric $R objects_compared)"
+check "info values compared (3 objects x 4 columns)" 12 "$(infometric $R values_compared)"
+check "info values equal (TAC 57252.00 against 57252 is equal)" 10 "$(infometric $R values_equal)"
+check "info values different" 1 "$(infometric $R values_different)"
+check "info NULL in old only" 1 "$(infometric $R values_null_old_only)"
+check "the info difference is CELL_NAME of 1|2" "1|2,CELL_NAME,c12,c12-X"   "$("$DUCKDB" -csv -noheader -c "SELECT object_key, info_column, old_value, new_value FROM read_csv('$R/info_differences.csv') WHERE kind = 'DIFF'")"
+
+echo "O. INFO_COMPARE=no (default): no info files are written"
+variant O "${INFOCFG[@]}" INFO_COMPARE=no
+code=$(run O); R=$W/report_O
+check "no info_verdict.txt" 0 "$([ -f "$R/info_verdict.txt" ] && echo 1 || echo 0)"
+check "exit code (0 = IDENTICAL)" 0 "$code"
+
+echo "P. a bad INFO_COLS name is refused"
+variant P "${INFOCFG[@]}" 'INFO_COLS="SITE_NAME;drop"'
+code=$(run P)
+check "exit code (2 = bad setup)" 2 "$code"
+
+echo "Q. a tall NEW side has no info columns: the info check is NOT COMPARABLE, the KPI result is as in A"
+variant Q INFO_COMPARE=yes INFO_COLS=CELL_NAME
+code=$(run Q); R=$W/report_Q
+check "exit code (1 = KPI DIFFERENT, as in A)" 1 "$code"
+check "info verdict starts with" "NOT COMPARABLE" "$(cut -d: -f1 "$R/info_verdict.txt")"
+
+echo "R. LIST mode: one config, a file with the table pairs, one report folder per pair"
+printf 'name,old_table,new_table,key_cols,info_cols
+first,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,CELL_NAME
+second,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,
+broken,old_pivot;drop,KPI_CALCULATED,SITE_ID;CELL_ID,
+' > "$W/pairs.csv"
+variant R MODE=list "PAIRS_FILE=$W/pairs.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes
+code=$(run R); R=$W/report_R
+check "exit code (2 = one pair could not run)" 2 "$code"
+check "first pair: KPI result as in A" DIFFERENT "$(cut -d: -f1 "$R/first/verdict.txt")"
+check "first pair: values different as in A" 1 "$(metric $R/first values_different)"
+check "second pair has its own report folder" 1 "$([ -f "$R/second/verdict.txt" ] && echo 1 || echo 0)"
+check "rows in pairs_summary.csv (3 pairs)" 3 "$(rows $R/pairs_summary.csv)"
+check "the broken pair is an ERROR" ERROR "$("$DUCKDB" -csv -noheader -c "SELECT result FROM read_csv('$R/pairs_summary.csv') WHERE name = 'broken'")"
+check "info columns only for the pair that asks for them" "1,0" "$([ -f "$R/first/info_verdict.txt" ] && echo -n 1 || echo -n 0),$([ -f "$R/second/info_verdict.txt" ] && echo 1 || echo 0)"
+
+echo "S. FINAL_REPORT=yes in list mode builds the Word report + Excel sheets; a report problem never changes the exit code"
+PY="$(command -v python3 || command -v python || true)"
+if [ -z "$PY" ]; then echo "  skipped (python not found)"; else
+printf 'name,old_table,new_table,key_cols,info_cols
+first,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,CELL_NAME
+second,old_pivot,KPI_CALCULATED,SITE_ID;CELL_ID,
+' > "$W/pairs2.csv"
+variant S MODE=list "PAIRS_FILE=$W/pairs2.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes FINAL_REPORT=yes "FINAL_REPORT_DIR=$W/final_S" 'FINAL_REPORT_AUTHOR=Test Person'
+code=$(run S); R=$W/report_S; F=$W/final_S
+check "exit code is still the comparison result (1 = DIFFERENT)" 1 "$code"
+check "Word report exists" 1 "$([ -s "$F/Test Summary Report - NS Pivot Comparison.docx" ] && echo 1 || echo 0)"
+check "one zip of the whole output folder exists" 1 "$([ -s "$F.zip" ] && echo 1 || echo 0)"
+check "Results workbook exists" 1 "$([ -s "$F/NS Pivot Comparison - Results.xlsx" ] && echo 1 || echo 0)"
+check "one results workbook per table" "1,1" "$([ -s "$F/first/first - results.xlsx" ] && echo -n 1 || echo -n 0),$([ -s "$F/second/second - results.xlsx" ] && echo 1 || echo 0)"
+check "run folder was copied to Supporting_details" 1 "$([ -f "$F/Supporting_details/pairs_summary.csv" ] && echo 1 || echo 0)"
+check "config_used.env of a table records the key columns it really used" "OLD_KEY_COLS=SITE_ID,CELL_ID" "$(grep '^OLD_KEY_COLS=' "$R/first/config_used.env" | tail -1)"
+check "config_used.env of a table records its own old table" "OLD_TABLE=old_pivot" "$(grep '^OLD_TABLE=' "$R/second/config_used.env" | tail -1)"
+check "every XML part of the Word and Excel files is well formed" "OK" "$("$PY" -I -c "
+import sys, zipfile, xml.dom.minidom as m
+f = sys.argv[1]
+for p in ['Test Summary Report - NS Pivot Comparison.docx', 'NS Pivot Comparison - Results.xlsx', 'first/first - results.xlsx']:
+    z = zipfile.ZipFile(f + '/' + p)
+    for n in z.namelist():
+        m.parseString(z.read(n))
+print('OK')
+" "$F" 2>&1 | tail -1)"
+check "the Results sheet says NOT MET for table first" 1 "$("$PY" -I -c "
+import sys, zipfile
+z = zipfile.ZipFile(sys.argv[1] + '/NS Pivot Comparison - Results.xlsx')
+print(1 if 'NOT MET' in z.read('xl/worksheets/sheet1.xml').decode() else 0)
+" "$F")"
+# the same run again: the output folder exists, nothing is overwritten, and the exit code is unchanged
+code=$(run S)
+check "second run: exit code unchanged (1)" 1 "$code"
+check "second run: says the folder already exists" 1 "$(grep -c 'already exists' "$W/S.out")"
+# a bad report setting only stops the report
+variant S2 MODE=list "PAIRS_FILE=$W/pairs2.csv" FAIL_ON_OBJECTS_ONE_SIDE=yes FINAL_REPORT=yes "FINAL_REPORT_DIR=$W/final_S2" 'FINAL_REPORT_TITLE=bad;title'
+code=$(run S2)
+check "bad FINAL_REPORT_TITLE: exit code unchanged (1)" 1 "$code"
+check "bad FINAL_REPORT_TITLE: no report folder" 0 "$([ -d "$W/final_S2" ] && echo 1 || echo 0)"
+fi
 
 echo
 echo "passed: $PASS   failed: $FAIL"

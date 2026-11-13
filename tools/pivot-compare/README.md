@@ -115,6 +115,64 @@ found *and* there is something in common. Nothing in common is `NOT COMPARABLE`,
 * A NULL on one side and a value on the other is reported, not hidden (`NULL_AS_DEFAULT=no`). A KPI that is NULL on
   both sides counts as equal.
 
+## Final output to share (optional, `FINAL_REPORT=yes`, list mode)
+
+The report folder holds raw files. For a reader (a lead, a reviewer) the run can also build one folder to hand over, the
+same on dev or UAT. It reads the report folder and writes a **new** folder `<REPORT_DIR>_FINAL_OUTPUT_RESULT` (it refuses to
+overwrite one, and never touches the databases or the report folder):
+
+```
+Test Summary Report - <title>.docx   Word report, chapters like the team's Test Summary Report template
+<title> - Results.xlsx               one line per table (status, counts, comment) + how to read + NEW data tested + open items
+<TABLE>/                             one folder per table, same pattern: <TABLE> - results.xlsx + summary.txt
+Supporting_details/                  copy of the raw report folder (duplicate_keys.csv and files over 5 MB left out, listed in NOT_COPIED.txt)
+```
+
+The whole folder is also written as one zip next to it (`<REPORT_DIR>_FINAL_OUTPUT_RESULT.zip`), so there is one file to download.
+
+* **Status** per table: `PASS` only with 0 different values, nothing on one side only, nothing empty on one side and no KPI column
+  on one side only. Otherwise `NOT MET`, with the numbers in the comment. The column "All paired values equal?" shows the
+  tables whose paired values are all equal even when objects are missing on one side.
+* Everything numeric (counts, KPIs with different values, keys, period, tolerance) is built from the run itself. What a person
+  has confirmed (out of scope, variations, observations, open items, conclusion) comes from the optional `FINAL_REPORT_NOTES_FILE`
+  and `FINAL_REPORT_COMMENTS_FILE`; without them those chapters say "None recorded for this run". Example files:
+  `docs/final_report_notes_dev_20261105.md`, `docs/final_report_comments_dev_20261105.csv`.
+* Needs `python3` (standard library only). Without it a message is printed; the comparison result and exit code never change.
+* By hand: `python3 scripts/make_final_report.py REPORT_DIR OUT_DIR --title "NS Pivot Comparison" --notes notes.md`.
+* `config_used.env` of every table now ends with the values that table really used (`OLD_TABLE`, `NEW_TABLE`, key and info
+  columns): in list and auto mode they differ from the base config lines above them, and the last line wins.
+
+## Info columns (optional, `INFO_COMPARE=yes`)
+
+The KPI values are the calculator's output. Columns such as `SITE_NAME`, `CELL_NAME`, `LAC`, `SAC`, `TAC` are labels copied from
+CM or mapping data. With `INFO_COMPARE=yes` and `INFO_COLS=SITE_NAME,CELL_NAME,LAC,SAC,TAC` they are compared too, for the objects
+that exist on both sides (wide sides only; a tall side has no such columns and gives `NOT COMPARABLE`). The result is **reported
+separately** (`info_verdict.txt`, `info_summary.csv`, `info_column_summary.csv`, `info_differences.csv`) and **never changes the KPI
+verdict or the exit code**. Numbers are compared as numbers (`57252.00` equals `57252`), everything else as text.
+
+## CM comparison (optional, `CM_COMPARE=yes`)
+
+A KPI mismatch is often caused by the CM data (configuration management: cell parameters, bandwidth, frequency ...) and not
+by the calculation. With `CM_COMPARE=yes` the run also compares one CM table of the old side with one CM table of the new side.
+With `CM_COMPARE=no` (the default) the CM step does not run at all and no `cm/` folder is written.
+
+```
+OLD CM_ERS_LTE_CALC                          NEW CM_ERS_LTE_CALC
+CELL_NAME  INSERT_DT    BW   FREQ            CELL_NAME  INSERT_DT    BW   FREQ
+A          2025-12-01   20   100             A          2025-12-01   20   100     -> equal
+B          2025-12-01   10   200             B          2025-12-01   15   200     -> BW differs
+```
+
+* An object is the `CM_KEY_COLS` joined with `|`. Every other column is compared (`CM_EXCLUDE_COLS` leaves some out), as text,
+  or as numbers with the KPI tolerance when both are numbers.
+* CM tables keep history (the dev `CM_ERS_LTE_CALC` has 403 loads since 2023). With `CM_ASOF_COL` set, the row **in force at
+  `PERIOD_TO`** is used per object (the latest row with `CM_ASOF_COL <= PERIOD_TO`), so a CM load after the period cannot
+  cause a difference. Objects that still have several rows are counted (`objects_with_several_rows`).
+* Files in `REPORT_DIR/cm/` (in auto mode also `REPORT_DIR/cm/`): `cm_verdict.txt`, `cm_summary.csv`, `cm_differences.csv`,
+  `cm_objects_one_side.csv`, `cm_columns_one_side.csv`, `cm_column_summary.csv`, `generated_cm.sql`.
+* A CM `DIFFERENT` makes the exit code 1 even when the KPI result is IDENTICAL. The CM tables are in `config.env`
+  (`CM_OLD_*`, `CM_NEW_*`); the sources work like the KPI sides.
+
 ## Likely reasons for a difference that is *not* a bug
 
 Do not "fix" a difference by changing either calculator: report it with the likely reason.
@@ -162,3 +220,9 @@ tolerance (and the NaN rule). Recorded output: `docs/local_test_output.txt`, `do
 * A very large comparison (all periods of a day, 60,000 cells x 466 KPIs) is millions of rows per period; set
   `MEMORY_LIMIT`, `TEMP_DIR` and keep the window small on the shared dev server.
 * The comparison is only as meaningful as the input: it cannot tell you that the two calculators were fed the same counters.
+
+## Offline servers (UAT / prod without internet)
+
+Nothing is built or installed: copy the folder, create `.env`, run `bash run.sh <config>.env`. It needs `bash`, the DuckDB CLI file, `python3` (only for `FINAL_REPORT=yes`, standard library only) and network access to the databases.
+
+One item to check: reading a Postgres source needs the DuckDB `postgres` extension. `run.sh` tries `LOAD postgres` first (no internet needed) and `INSTALL postgres` (a download) only if that fails; if both fail it stops at the start with a clear message. On a server without internet, copy the extension once from a machine that has it (the dev server): `~/.duckdb/extensions/<duckdb version>/<platform>/postgres_scanner.duckdb_extension` to the same folder for the user that runs the tool. Check with: `<duckdb> -c "LOAD postgres;"` (no output means it works).

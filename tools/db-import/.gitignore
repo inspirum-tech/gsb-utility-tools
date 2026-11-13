@@ -1,0 +1,4 @@
+configs/*.env
+reports/
+bundle/
+*.tar.gz

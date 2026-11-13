@@ -1,3 +1,9 @@
 tests/work/
 tests/work_pg/
 report/
+report_*/
+*_FINAL_OUTPUT_RESULT/
+tmp/
+.env
+*.log
+__pycache__/
