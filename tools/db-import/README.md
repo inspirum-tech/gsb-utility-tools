@@ -59,6 +59,14 @@ download anything, so the extensions travel with the tool. Only needed when Duck
 
 Postgres -> Postgres needs no bundle.
 
+**Server that already has DuckDB and its extensions installed (UAT):** no bundle is needed. Set in the config
+`DUCKDB="<path to the duckdb program>"` and `DUCKDB_EXTENSION_DIR="<folder>"` where the folder holds
+`<duckdb version>/<platform>/postgres_scanner.duckdb_extension` and `ducklake.duckdb_extension`
+(on UAT: `/apps/moosefs/mount/software/duckdb/cli/1.5.5/duckdb` and `/apps/moosefs/mount/software/duckdb/extension`).
+The script checks that the version folder matches the program's version and that the needed extension files are there,
+loads only from that folder and never downloads. For a `flightsql` source the Python packages then come from the
+server's own `python3` (no `bundle/pylibs`). Do not run `prepare-bundle.sh` on such a server: it downloads.
+
 A `flightsql` source also needs Python packages (pyarrow, adbc-driver-flightsql): build them once on a machine with internet with `./prepare-bundle.sh --tar --with-flightsql`
 (the same Python minor version as the server that will run the tool; they land in `bundle/pylibs`). Details: RUNBOOK section 3.5.
 

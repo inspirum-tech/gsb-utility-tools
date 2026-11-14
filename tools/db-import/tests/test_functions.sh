@@ -110,6 +110,11 @@ BK_NAME=("KPI_X_bak_20261112_101500"); LOAD_MODE=replace; DRY_RUN=no
 DK="$(build_duck_sql 0)"
 has "duck: stop at first error"  ".bail on" "$DK"
 has "duck: bundle extension dir" "SET extension_directory='/opt/db-import/bundle/extensions';" "$DK"
+DUCKDB_EXTENSION_DIR=/apps/moosefs/mount/software/duckdb/extension
+has "duck: server extension dir replaces bundle" "SET extension_directory='/apps/moosefs/mount/software/duckdb/extension';" "$(build_duck_sql 0)"
+hasnt "duck: server extension dir: bundle not used" "bundle/extensions" "$(build_duck_sql 0)"
+DUCKDB_EXTENSION_DIR=
+fails "DUCKDB_EXTENSION_DIR with a space refused" check_re DUCKDB_EXTENSION_DIR '/apps/x y' "$re_path"
 has "duck: no auto download"     "SET autoinstall_known_extensions=false;" "$DK"
 has "duck: UTC by default"       "SET TimeZone='UTC';" "$DK"
 TIMEZONE=Australia/Sydney

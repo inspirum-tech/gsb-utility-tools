@@ -63,6 +63,11 @@ If the user cannot create the backup tables, ask your DBA for the right, or set 
    ```
    (Or simply copy the whole `db-import` folder from dev with `bundle/` in it.) The tool checks the bundle itself on every run (checksums and DuckDB version) and stops if it is damaged or incomplete.
    For Postgres -> Postgres no bundle is needed.
+   **No bundle either when the server already has DuckDB and its extensions installed** (UAT does): set in the config
+   `DUCKDB="/apps/moosefs/mount/software/duckdb/cli/1.5.5/duckdb"` and `DUCKDB_EXTENSION_DIR="/apps/moosefs/mount/software/duckdb/extension"`
+   (the folder that holds `v1.5.5/linux_amd64/postgres_scanner.duckdb_extension` and `ducklake.duckdb_extension`). The tool checks the version
+   folder matches the program and that the files are there; it never downloads. With a `flightsql` source the Python packages (pyarrow,
+   adbc-driver-flightsql) must then be installed for the server's `python3`. Skip steps 4 and 5 in that case.
    **Never run `prepare-bundle.sh` on UAT or prod:** it downloads the extensions, so it needs internet. Run it once on dev (or any machine with internet and the same DuckDB version), then copy `bundle/` over.
    The extensions only work with the exact DuckDB version they were built for (dev and UAT both have v1.5.5). The tool uses `bundle/duckdb` when it exists; the `DUCKDB=<path>` setting is used only when there is no `bundle/duckdb`
    (a `DUCKDB=...` line typed on its own in the terminal is not seen by the script: use `export DUCKDB=...` or put it in front of the command). Using the server's own CLI instead of `bundle/duckdb` was not tested.
@@ -154,7 +159,8 @@ The target table must already exist. The tool never creates tables.
 | `FULL_COPY_TABLES` | table names | for a table with **no time column** that must be replaced whole. A table without the time column that is not listed stops the run |
 | `TABLE_TIME_COLUMNS` | `TABLE:COLUMN,TABLE:COLUMN` | only for a table whose time column has a different name |
 | `OFFLINE` | `yes` (default) / `no` | yes: DuckDB uses only `bundle/` (leave it `yes` on UAT and prod) |
-| `DUCKDB` | path | only if you must use another DuckDB program; `bundle/duckdb` is used first |
+| `DUCKDB` | path | the DuckDB program; `bundle/duckdb` is used first when it exists and `DUCKDB_EXTENSION_DIR` is not set |
+| `DUCKDB_EXTENSION_DIR` | folder | extensions already installed on the server (`<folder>/<duckdb version>/<platform>/*.duckdb_extension`). When set, no `bundle/` is needed or used. UAT: `/apps/moosefs/mount/software/duckdb/extension` |
 | `REPORT_DIR` | folder | where each run writes its report (default `./reports`). Must be writable by the user who runs the tool |
 
 ### 3.5 Reading through the Flight SQL API (`SOURCE_TYPE="flightsql"`)
@@ -433,6 +439,8 @@ Every message below is printed before anything is written, unless stated. Exit c
 | `bundle checksum failed` | the bundle was damaged or only partly copied: copy it again and check it with `sha256sum -c` |
 | `DuckDB version is X but the bundle was built for Y` | use the DuckDB in `bundle/duckdb` (do not set `DUCKDB`), or rebuild the bundle on dev |
 | `extension '...' is not in the bundle` | rebuild the bundle on dev: `./prepare-bundle.sh --tar` |
+| `DUCKDB_EXTENSION_DIR has no folder 'vX.Y.Z'` | the extensions in that folder are for another DuckDB version than the `DUCKDB` program; point `DUCKDB` at the matching CLI (UAT: `.../duckdb/cli/1.5.5/duckdb`) |
+| `extension '...' is not in <DUCKDB_EXTENSION_DIR>/vX.Y.Z` | `postgres_scanner.duckdb_extension` / `ducklake.duckdb_extension` is missing from the server's extension folder; install it there (someone with internet) or use a bundle |
 | `mkdir: cannot create directory ... Permission denied` (report folder) | `REPORT_DIR` is owned by another user: set `REPORT_DIR` to a folder you can write |
 | `permission denied for schema/database ...` when `BACKUP="on"` | the user cannot create the backup schema: ask the DBA, or use `BACKUP="off"` |
 | `row count check failed: expected N, found M` (table FAILED, rolled back) | the source changed during the run, or a trigger/rule changed the rows on the target. Nothing was changed for that table. Run again |

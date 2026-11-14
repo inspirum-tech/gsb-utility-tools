@@ -12,8 +12,9 @@
 # flightsql = the gsb-kpi-data-api Flight SQL interface, read in small time slices by flightsql_export.py
 # (python3 + pyarrow + adbc-driver-flightsql from bundle/pylibs); the files are then imported like parquet.
 # Postgres -> Postgres uses psql only. Every other combination uses the DuckDB CLI, with its
-# extensions loaded from ./bundle (built once on a machine with internet by prepare-bundle.sh), so
-# nothing is downloaded on an offline server. Everything is set in the config file; see
+# extensions loaded from ./bundle (built once on a machine with internet by prepare-bundle.sh) or, with
+# DUCKDB_EXTENSION_DIR, from the extensions already installed on the server, so nothing is downloaded
+# on an offline server. Everything is set in the config file; see
 # config.example.env. Needs bash 4+ (and psql and/or duckdb). Standalone: shares nothing with the
 # other tools in this repository.
 set -euo pipefail
@@ -269,7 +270,7 @@ duck_head() { # the start of every DuckDB script
     local out=".bail on
 " ext
     if [ "$OFFLINE" = yes ]; then
-        out+="SET extension_directory='$(sqlq "$BUNDLE_DIR/extensions")';
+        out+="SET extension_directory='$(sqlq "${DUCKDB_EXTENSION_DIR:-$BUNDLE_DIR/extensions}")';
 SET autoinstall_known_extensions=false;
 SET autoload_known_extensions=false;
 "
@@ -335,7 +336,8 @@ duck_version_of() { "$1" -init /dev/null --version 2>/dev/null | head -1 | awk '
 
 setup_duck() {
     DUCK_BIN="$DUCKDB"
-    if [ -x "$BUNDLE_DIR/duckdb" ]; then DUCK_BIN="$BUNDLE_DIR/duckdb"; fi
+    # bundle/duckdb is used first, unless the server's own extensions are used (DUCKDB_EXTENSION_DIR)
+    if [ -z "$DUCKDB_EXTENSION_DIR" ] && [ -x "$BUNDLE_DIR/duckdb" ]; then DUCK_BIN="$BUNDLE_DIR/duckdb"; fi
     command -v "$DUCK_BIN" >/dev/null 2>&1 || [ -x "$DUCK_BIN" ] \
         || die "DuckDB CLI not found ('$DUCK_BIN'). Set DUCKDB=<path> in the config, or run prepare-bundle.sh on dev and copy bundle/ here."
     DUCK_EXTS=""
@@ -346,6 +348,23 @@ setup_duck() {
     DUCK_EXTS="$(printf '%s\n' $DUCK_EXTS | sort -u | tr '\n' ' ')"
     log "DuckDB: $DUCK_BIN ($(duck_version_of "$DUCK_BIN")); extensions needed: ${DUCK_EXTS:-none}"
     [ "$OFFLINE" = yes ] || { warn "OFFLINE=no: DuckDB may download extensions (only for a machine with internet)"; return 0; }
+
+    # Extensions already installed on this server (no bundle): <dir>/<duckdb version>/<platform>/<name>.duckdb_extension
+    if [ -n "$DUCKDB_EXTENSION_DIR" ]; then
+        local ver e f
+        [ -d "$DUCKDB_EXTENSION_DIR" ] || die "DUCKDB_EXTENSION_DIR '$DUCKDB_EXTENSION_DIR' is not a folder"
+        ver="$(duck_version_of "$DUCK_BIN")"
+        [ -d "$DUCKDB_EXTENSION_DIR/$ver" ] \
+            || die "DUCKDB_EXTENSION_DIR has no folder '$ver' (the version of $DUCK_BIN): the extensions there belong to another DuckDB version. Found: $(ls "$DUCKDB_EXTENSION_DIR" 2>/dev/null | tr '\n' ' ')"
+        for e in $DUCK_EXTS; do
+            [ "$e" = parquet ] && continue      # built into the DuckDB CLI
+            f="$e"; [ "$e" = postgres ] && f="postgres_scanner"
+            find "$DUCKDB_EXTENSION_DIR/$ver" -name "$f.duckdb_extension" | grep -q . \
+                || die "extension '$e' ($f.duckdb_extension) is not in $DUCKDB_EXTENSION_DIR/$ver"
+        done
+        log "DuckDB extensions: $DUCKDB_EXTENSION_DIR/$ver (installed on this server, no bundle)"
+        return 0
+    fi
 
     [ -d "$BUNDLE_DIR/extensions" ] && [ -f "$BUNDLE_DIR/VERSION" ] \
         || die "offline bundle not found in $BUNDLE_DIR. On a machine with internet run ./prepare-bundle.sh and copy the bundle/ folder next to this script (README, 'Offline')."
@@ -485,7 +504,7 @@ load_config() {
     : "${TIMEZONE:=UTC}"
     : "${FLIGHT_SLICE_MINUTES:=10}" "${FLIGHT_PAUSE_SECONDS:=2}" "${FLIGHT_MAX_ROWS:=100000}" "${FLIGHT_TIMEOUT_SECONDS:=120}"
     : "${EXPORT_DIR:=}" "${EXPORT_KEEP:=yes}" "${EXPORT_OVERWRITE:=no}" "${PYTHON:=python3}"
-    : "${OFFLINE:=yes}" "${DUCKDB:=duckdb}" "${BUNDLE_DIR:=$HERE/bundle}" "${REPORT_DIR:=$HERE/reports}"
+    : "${OFFLINE:=yes}" "${DUCKDB:=duckdb}" "${DUCKDB_EXTENSION_DIR:=}" "${BUNDLE_DIR:=$HERE/bundle}" "${REPORT_DIR:=$HERE/reports}"
 }
 
 validate_config() {
@@ -500,6 +519,7 @@ validate_config() {
     case "$BACKUP" in on|off) ;; *) die "BACKUP must be on or off";; esac
     case "$ON_ERROR" in stop|continue) ;; *) die "ON_ERROR must be stop or continue";; esac
     case "$OFFLINE" in yes|no) ;; *) die "OFFLINE must be yes or no";; esac
+    [ -z "$DUCKDB_EXTENSION_DIR" ] || check_re DUCKDB_EXTENSION_DIR "$DUCKDB_EXTENSION_DIR" "$re_path"
     if [ "$SOURCE_TYPE" = flightsql ]; then
         local n
         for n in FLIGHT_SLICE_MINUTES FLIGHT_MAX_ROWS FLIGHT_TIMEOUT_SECONDS; do
