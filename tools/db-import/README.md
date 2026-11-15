@@ -32,6 +32,14 @@ Example of what a real run does for one table (`LOAD_MODE=replace`, `BACKUP=on`)
 All of it is one transaction per table. The row count is checked inside the transaction; if it does not
 match, the table is rolled back and nothing is left behind (not even the backup).
 
+## Fast path: export on prod, import on UAT
+
+`./export-period.sh <config>` on a prod server writes the tables of a period (read only) into a folder: parquet data plus
+each table's columns, types, NOT NULL and DuckLake partitioning, with a `MANIFEST.sha256`. Carry the folder; on UAT
+`SOURCE_TYPE="export"` + `SOURCE_EXPORT_DIR` imports it into any `TARGET_SCHEMA`: a missing table is created like the
+prod one, an existing one is renamed to `<table>_bak_<date_time>` (`BACKUP=on`) or dropped (`BACKUP=off`) and created
+again; one transaction per table, row count checked. RUNBOOK section 3.6.
+
 ## Which engine runs
 
 | Source -> target | Engine | Needs on the server |

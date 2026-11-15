@@ -228,6 +228,34 @@ To import a table again on purpose, remove its `_IMPORTED` file (or set `EXPORT_
 - The row cap: the API cuts a result at `FLIGHTSQL__MAX_ROWS` **silently**, so a slice that comes back with exactly that many rows is suspect. The tool never imports such a slice as it is: with `FLIGHT_SPLIT_ON_CAP=yes` (default) it reads the slice again in pages (`ORDER BY ALL LIMIT/OFFSET`, half the cap per page) and accepts it only if the pages add up to the slice's `count(*)`; with `no` the table fails. One time stamp cannot be split by time, which is why the pages are needed. Set `FLIGHT_MAX_ROWS` to the API's real cap (read it from the API log: `START max_rows=...`); a lower value only causes needless paging, a higher one would let a cut result through.
 - `TIMEOUT ... context deadline exceeded` during `--check`: the count of one chunk took longer than `FLIGHT_TIMEOUT_SECONDS`. The retries kick in first; if it still fails, lower `FLIGHT_COUNT_MINUTES` or raise the time limit.
 
+### 3.6 Export on prod, carry the folder, import on UAT (`export-period.sh` + `SOURCE_TYPE="export"`)
+
+**When to use it.** Much faster than the Flight SQL API (one read per table instead of one query per 15 minutes) and exact: the rows, the column types, NOT NULL and the DuckLake partitioning of the prod table travel with the export. Needs a prod server with DuckDB and its extensions (as on UAT) that can read the prod DuckLake.
+
+**Step 1, on prod (read only).** A config with the `SOURCE_*` settings of the prod DuckLake, `SOURCE_SCHEMA`, `TABLES`, `PERIOD_FROM`, `PERIOD_TO`, `TIMEZONE`, `FULL_COPY_TABLES` (tables exported whole, e.g. CM), `DUCKDB`, `DUCKDB_EXTENSION_DIR`, and `EXPORT_DIR` (the folder to write). Then:
+```
+./export-period.sh --check configs/prod_export.env    # lists tables, columns, partitioning; writes nothing
+./export-period.sh         configs/prod_export.env
+```
+The source is attached `READ_ONLY`; each table is read in one transaction. Per table `EXPORT_DIR/<TABLE>/` gets `data/*.parquet` (zstd, files of `EXPORT_FILE_MB`, default 512), `columns.tsv` (names, types, nullable), `table.meta` (schema, table, period, time zone, rows, partitioning) and `_DONE`; `EXPORT_DIR/MANIFEST.sha256` covers every file. Started again after a stop, it keeps the tables already done (same period) and does the rest; `EXPORT_OVERWRITE="yes"` redoes all.
+
+**Step 2, carry the whole folder** to UAT (any way you like). Check it there: `(cd <folder> && sha256sum -c --quiet MANIFEST.sha256)` (the import checks it again itself).
+
+**Step 3, on UAT.** A normal target config (`TARGET_*`, `TARGET_SCHEMA` = any schema you want; it is created when missing) plus:
+```
+SOURCE_TYPE="export"
+SOURCE_EXPORT_DIR="/path/to/the/folder"
+TABLES="KPI_A,KPI_B,CM_CELL=CM_CELL_PROD"       # names in the export; "=NAME" to name the target table differently
+BACKUP="on"
+```
+`PERIOD_FROM` / `PERIOD_TO` / `LOAD_MODE` are not used: each table's period is in its `table.meta`. Then `--check`, `--dry-run`, real run as always.
+
+**What the import does, per table** (one transaction; any error rolls it back and leaves the old table as it was):
+- the target table does not exist: it is **created** from `columns.tsv` (same columns, types, NOT NULL) and given the prod table's partitioning (DuckLake target);
+- the target table exists: `BACKUP="on"` **renames** it to `<table>_bak_<date_time>` in the same schema, `BACKUP="off"` **drops** it; then it is created as above;
+- the exported rows are inserted and the table's row count must equal the `rows` in `table.meta`.
+So the target table ends up exactly equal to the export (only the exported period in it). The plan printed before anything changes shows, per table, the export rows, the rows the target holds now and the action (`CREATE`, `REPLACE: old table renamed to ...`, `REPLACE: old table DROPPED`). A damaged or half-copied folder (checksum) or a table without `_DONE` stops the run before anything is written. Drop the `_bak_` tables when you no longer need them.
+
 ## 4. Passwords
 
 Passwords are never written in the config. Two ways:

@@ -141,6 +141,35 @@ has "duck: check uses error()"   "error('row count check failed" "$DK"
 has "duck: commit"               "COMMIT;" "$DK"
 SOURCE_TYPE=parquet; SOURCE_PARQUET_GLOB='/data/{TABLE}/*.parquet'
 has "parquet source expression"  "read_parquet('/data/KPI_X/*.parquet')" "$(tbl_expr SOURCE KPI_X)"
+echo "export source (folder from export-period.sh)"
+(
+SOURCE_TYPE=export; SOURCE_EXPORT_DIR=/data/exp; TARGET_TYPE=ducklake; TARGET_SCHEMA=gsb_from_prod; DRY_RUN=no
+if (validate_side SOURCE) >/dev/null 2>&1; then ok "export: valid source accepted"; else bad "export: valid source accepted" accepted refused; fi
+fails "export: dir required" bash -c 'source "'"$HERE"'/db-import.sh"; SOURCE_TYPE=export; SOURCE_EXPORT_DIR=""; validate_side SOURCE'
+fails "export: not a target"  bash -c 'source "'"$HERE"'/db-import.sh"; TARGET_TYPE=export; TARGET_EXPORT_DIR=/x; validate_side TARGET'
+eq  "export: reads the data folder" "read_parquet('/data/exp/KPI_X/data/*.parquet')" "$(tbl_expr SOURCE KPI_X)"
+eq  "export: nothing to attach" "" "$(duck_attach SOURCE yes)"
+SRC_T=(KPI_X); TGT_T=(KPI_X); COMMON=($'A\nB\n'); SRC_CNT=(42); EXI_COLDEF=('"A" TIMESTAMP WITH TIME ZONE NOT NULL, "B" BIGINT')
+EXI_PART=('year("A"), month("A"), day("A")'); BK_NAME=(KPI_X_bak_20261115_101500)
+EXI_ACTION=(rename); X="$(exi_build_sql 0)"
+has "export rename: old table renamed"   'ALTER TABLE tgt."gsb_from_prod"."KPI_X" RENAME TO "KPI_X_bak_20261115_101500";' "$X"
+has "export: created from columns.tsv"   'CREATE TABLE tgt."gsb_from_prod"."KPI_X" ("A" TIMESTAMP WITH TIME ZONE NOT NULL, "B" BIGINT);' "$X"
+has "export: source partitioning"        'SET PARTITIONED BY (year("A"), month("A"), day("A"));' "$X"
+has "export: whole-table count check"    'SELECT CASE WHEN (SELECT count(*) FROM tgt."gsb_from_prod"."KPI_X") = 42' "$X"
+has "export: commit"                     'COMMIT;' "$X"
+EXI_ACTION=(drop); X="$(exi_build_sql 0)"
+has "export drop: table dropped"         'DROP TABLE tgt."gsb_from_prod"."KPI_X";' "$X"
+hasnt "export drop: no rename"           'RENAME TO' "$X"
+EXI_ACTION=(create); EXI_PART=(""); X="$(exi_build_sql 0)"
+hasnt "export create: no drop"           'DROP TABLE' "$X"
+hasnt "export create: no partition when none" 'PARTITIONED BY' "$X"
+DRY_RUN=yes; has "export dry-run: rollback" 'ROLLBACK;' "$(exi_build_sql 0)"
+[[ 'DECIMAL(18,3)' =~ $re_type ]] && ok "export: decimal type accepted" || bad "export: decimal type accepted" ok refused
+[[ "VARCHAR'; DROP" =~ $re_type ]] && bad "export: odd type refused" refused accepted || ok "export: odd type refused"
+echo "PASS=$PASS FAIL=$FAIL" >"$T/exp_counts"
+)
+read -r _p _f < <(sed 's/PASS=\([0-9]*\) FAIL=\([0-9]*\)/\1 \2/' "$T/exp_counts"); PASS=$_p; FAIL=$_f
+
 echo "flightsql source (no API: a fake flight_py stands in for the helper)"
 SOURCE_TYPE=flightsql; SOURCE_HOST=localhost; SOURCE_PORT=8815; SOURCE_SCHEMA=gsb_data_kpi_pivot; EXPORT_DIR=/data/export
 unset SOURCE_PASSWORD_ENV

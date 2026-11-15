@@ -214,3 +214,19 @@ Recorded in RUNBOOK sections 1 and 3.2 with two options (mount the folder, or tw
 
 Not tested by us: two separate DuckLake catalogs, a tunnel between environments, and a source data folder that exists only on another server. Only one more thing cannot be tested by us: a server that really has no network (UAT / prod). On dev the bundle was proven to work with an empty HOME and auto-download switched off, but dev does have a network.
 Everything else in the tool has been run on a database. Leftovers on dev (ours): schemas `dbimport_demo`, `dbimport_demo_bak` (Postgres); `dbimport_demo_dl`, `dbimport_demo_dl_bak` (DuckLake); `/tmp/dbimport_duck_test/`; `/tmp/dbimport_reports*`.
+
+
+## 12. Export on prod / import on UAT (export-period.sh, SOURCE_TYPE="export")
+
+Run on the agent host (aarch64) with DuckDB CLI v1.5.5 and a scratch Postgres 16 holding two DuckLake catalogs
+("prodlake", "uatlake"). Source: a table partitioned year/month/day on a TIMESTAMPTZ NOT NULL column (38 400 rows,
+19 200 in the period), an empty table, a CM table exported whole.
+- export: 19 200 / 0 / 100 rows; table.meta records the partitioning year/month/day; rerun keeps all three (_DONE).
+- import into another schema: 3 tables CREATED; prod vs UAT `EXCEPT ALL` both ways = 0 rows; types, NOT NULL and
+  partitioning on the UAT catalog equal prod.
+- rerun with BACKUP=on: each old table renamed to <table>_bak_<ts> (same rows), new one created and filled.
+- --dry-run: all rolled back (no new _bak_ table left). BACKUP=off: old tables dropped.
+- one byte appended to a parquet file: checksum fails, nothing changed.
+- table.meta row count off by one (manifest regenerated): row-count check fails, transaction rolled back, old table
+  unchanged, no backup table left.
+Not run: a real prod / UAT pair, a Postgres target for an export.

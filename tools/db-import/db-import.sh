@@ -138,6 +138,7 @@ side_fingerprint() {
         duckdb)            printf '%s' "$(v "${P}_DB_FILE")" ;;
         parquet)           printf 'parquet:%s' "$(v "${P}_PARQUET_GLOB")" ;;
         flightsql)         printf 'flightsql:%s:%s' "$(v "${P}_HOST")" "$(v "${P}_PORT")" ;;
+        export)            printf 'export:%s' "$(v "${P}_EXPORT_DIR")" ;;
     esac
 }
 
@@ -175,11 +176,15 @@ validate_side() {
             check_re "${P}_HOST" "$(v "${P}_HOST")" "$re_host"
             check_re "${P}_PORT" "$(v "${P}_PORT")" "$re_port"
             check_re "${P}_SCHEMA" "$(v "${P}_SCHEMA")" "$re_ident" ;;
+        export)
+            [ "$P" = SOURCE ] || die "TARGET_TYPE=export is not supported (an export made by export-period.sh can only be a source)"
+            [ -n "$(v "${P}_EXPORT_DIR")" ] || die "${P}_EXPORT_DIR is not set (the folder written by export-period.sh)"
+            check_re "${P}_EXPORT_DIR" "$(v "${P}_EXPORT_DIR")" "$re_path" ;;
         parquet)
             [ "$P" = SOURCE ] || die "TARGET_TYPE=parquet is not supported (parquet can only be a source)"
             [ -n "$(v "${P}_PARQUET_GLOB")" ] || die "${P}_PARQUET_GLOB is not set (example: /data/{TABLE}/*.parquet)"
             check_re "${P}_PARQUET_GLOB" "$(v "${P}_PARQUET_GLOB")" "$re_path" ;;
-        *) die "${P}_TYPE must be postgres, duckdb, ducklake, parquet or flightsql (target: only postgres, duckdb, ducklake); got '$type'" ;;
+        *) die "${P}_TYPE must be postgres, duckdb, ducklake, parquet, flightsql or export (target: only postgres, duckdb, ducklake); got '$type'" ;;
     esac
     pwval "$P" >/dev/null
 }
@@ -273,7 +278,7 @@ duck_attach() { # side readonly(yes|no)
         ducklake) printf "ATTACH 'ducklake:postgres:%s' AS %s (DATA_PATH '%s', METADATA_SCHEMA '%s'%s);\n" \
                       "$(sqlq "$(pg_conninfo "$P")")" "$alias" "$(sqlq "$(v "${P}_DUCKLAKE_DATA_PATH")")" \
                       "$(sqlq "$(v "${P}_DUCKLAKE_METADATA_SCHEMA")")" "$opt" ;;
-        parquet|flightsql) : ;;   # read with read_parquet() (flightsql: the exported files), nothing to attach
+        parquet|flightsql|export) : ;;   # read with read_parquet() (flightsql / export: the exported files), nothing to attach
     esac
 }
 
@@ -307,6 +312,8 @@ tbl_expr() { # side table
         printf "read_parquet('%s')" "$(sqlq "${g//\{TABLE\}/$t}")"
     elif [ "$(v "${P}_TYPE")" = flightsql ]; then
         printf "read_parquet('%s')" "$(sqlq "$EXPORT_DIR/$t/*.parquet")"
+    elif [ "$(v "${P}_TYPE")" = export ]; then
+        printf "read_parquet('%s')" "$(sqlq "$(v "${P}_EXPORT_DIR")/$t/data/*.parquet")"
     else
         printf '%s."%s"."%s"' "$alias" "$(v "${P}_SCHEMA")" "$t"
     fi
@@ -362,7 +369,7 @@ setup_duck() {
     DUCK_EXTS=""
     local P t; for P in SOURCE TARGET; do
         t="$(v "${P}_TYPE")"
-        case "$t" in postgres) DUCK_EXTS+=" postgres" ;; ducklake) DUCK_EXTS+=" postgres ducklake" ;; parquet|flightsql) DUCK_EXTS+=" parquet" ;; esac
+        case "$t" in postgres) DUCK_EXTS+=" postgres" ;; ducklake) DUCK_EXTS+=" postgres ducklake" ;; parquet|flightsql|export) DUCK_EXTS+=" parquet" ;; esac
     done
     DUCK_EXTS="$(printf '%s\n' $DUCK_EXTS | sort -u | tr '\n' ' ')"
     log "DuckDB: $DUCK_BIN ($(duck_version_of "$DUCK_BIN")); extensions needed: ${DUCK_EXTS:-none}"
@@ -615,7 +622,7 @@ load_config() {
     : "${FLIGHT_SLICE_MINUTES:=15}" "${FLIGHT_PAUSE_SECONDS:=2}" "${FLIGHT_MAX_ROWS:=100000}" "${FLIGHT_TIMEOUT_SECONDS:=120}"
     : "${FLIGHT_COUNT_MINUTES:=0}" "${FLIGHT_RETRIES:=3}" "${FLIGHT_RETRY_WAIT_SECONDS:=5}" "${FLIGHT_COUNT:=no}" "${FLIGHT_MAX_MESSAGE_MB:=1024}"
     : "${FLIGHT_PARALLEL_TABLES:=4}" "${FLIGHT_SPLIT_ON_CAP:=yes}"
-    : "${EXPORT_DIR:=}" "${EXPORT_KEEP:=yes}" "${EXPORT_OVERWRITE:=no}" "${PYTHON:=python3}"
+    : "${EXPORT_DIR:=}" "${EXPORT_KEEP:=yes}" "${EXPORT_OVERWRITE:=no}" "${PYTHON:=python3}" "${SOURCE_EXPORT_DIR:=}"
     : "${OFFLINE:=yes}" "${DUCKDB:=duckdb}" "${DUCKDB_EXTENSION_DIR:=}" "${BUNDLE_DIR:=$HERE/bundle}" "${REPORT_DIR:=$HERE/reports}"
 }
 
@@ -664,9 +671,13 @@ validate_config() {
         check_re "TABLE_TIME_COLUMNS table" "${e%%:*}" "$re_ident"; check_re "TABLE_TIME_COLUMNS column" "${e#*:}" "$re_ident"
     done
     for e in ${FULL_COPY_TABLES//,/ }; do check_re "FULL_COPY_TABLES entry" "$e" "$re_ident"; done
-    FROM_TS="$(norm_ts "$PERIOD_FROM")" || die "PERIOD_FROM '$PERIOD_FROM' is not valid. Use YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]"
-    TO_TS="$(norm_ts "$PERIOD_TO")"     || die "PERIOD_TO '$PERIOD_TO' is not valid. Use YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]"
-    [[ "$FROM_TS" < "$TO_TS" ]] || die "PERIOD_FROM ($FROM_TS) must be earlier than PERIOD_TO ($TO_TS)"
+    if [ "$SOURCE_TYPE" = export ]; then
+        FROM_TS="(from the export)"; TO_TS="(from the export)"      # each table's period is recorded in its table.meta
+    else
+        FROM_TS="$(norm_ts "$PERIOD_FROM")" || die "PERIOD_FROM '$PERIOD_FROM' is not valid. Use YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]"
+        TO_TS="$(norm_ts "$PERIOD_TO")"     || die "PERIOD_TO '$PERIOD_TO' is not valid. Use YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]"
+        [[ "$FROM_TS" < "$TO_TS" ]] || die "PERIOD_FROM ($FROM_TS) must be earlier than PERIOD_TO ($TO_TS)"
+    fi
     parse_tables
     if [ "$SOURCE_TYPE" = postgres ] && [ "$TARGET_TYPE" = postgres ]; then ENGINE=pg; else ENGINE=duck; fi
     if [ "${EXPORT_ONLY:-no}" = no ] && [ "$(side_fingerprint SOURCE)" = "$(side_fingerprint TARGET)" ] && [ "$SOURCE_SCHEMA" = "$TARGET_SCHEMA" ]; then
@@ -881,6 +892,141 @@ run_table() { # i
     return 1
 }
 
+# ---------------------------------------------------------------------------------------------
+# SOURCE_TYPE="export": a folder written by export-period.sh (prod). Every listed table is REPLACED WHOLE:
+# an existing target table is renamed to <table>_bak_<date_time> (BACKUP=on) or dropped (BACKUP=off),
+# then created again from the export's columns.tsv (names, types, NOT NULL) and partitioning, and the
+# exported rows are inserted; one transaction per table, row count checked against table.meta.
+# ---------------------------------------------------------------------------------------------
+declare -a EXI_COLDEF EXI_PART EXI_PERIOD EXI_ACTION
+re_type='^[A-Za-z0-9_ (),.]+(\[\])*$'
+re_part='^[A-Za-z0-9_(),". ]+$'
+
+exi_meta() { sed -n "s/^$2=//p" "$1/table.meta" | head -1; }
+
+exi_read_table() { # i : reads the export of table i into the arrays
+    local i="$1" m="$SOURCE_EXPORT_DIR/${SRC_T[$1]}" n t nl defs="" cols="" first=yes
+    [ -f "$m/_DONE" ] && [ -f "$m/table.meta" ] && [ -f "$m/columns.tsv" ] \
+        || die "${SRC_T[$i]}: not in the export, or incomplete (no _DONE / table.meta / columns.tsv in $m)"
+    [ "$(exi_meta "$m" format)" = "db-import-export/1" ] || die "${SRC_T[$i]}: unknown export format '$(exi_meta "$m" format)'"
+    while IFS=$'\t' read -r n t nl; do
+        if [ "$first" = yes ]; then first=no; continue; fi           # header line
+        [ -n "$n" ] || continue
+        bad_col "$n" && die "${SRC_T[$i]}: column name '$n' is not supported"
+        [[ "$t" =~ $re_type ]] || die "${SRC_T[$i]}: column $n has a type the tool does not accept: '$t'"
+        defs+="${defs:+, }\"$n\" $t"; [ "$nl" != NO ] || defs+=" NOT NULL"
+        cols+="$n"$'\n'
+    done <"$m/columns.tsv"
+    [ -n "$cols" ] || die "${SRC_T[$i]}: columns.tsv lists no column"
+    SRC_COLS[$i]="$cols"; COMMON[$i]="$cols"; EXI_COLDEF[$i]="$defs"
+    SRC_CNT[$i]="$(exi_meta "$m" rows)"; [[ "${SRC_CNT[$i]}" =~ ^[0-9]+$ ]] || die "${SRC_T[$i]}: table.meta has no row count"
+    MODE[$i]="$(exi_meta "$m" mode)"; TC[$i]="$(exi_meta "$m" time_column)"
+    EXI_PERIOD[$i]="$( [ "${MODE[$i]}" = full ] && echo 'whole table' || echo "$(exi_meta "$m" period_from) .. $(exi_meta "$m" period_to) $(exi_meta "$m" timezone)")"
+    local p; p="$(exi_meta "$m" partition)"
+    [ "$TARGET_TYPE" = ducklake ] || p=""                  # as the source had it (none = none); only a DuckLake target is partitioned
+    [ -z "$p" ] || [[ "$p" =~ $re_part ]] || die "${SRC_T[$i]}: partitioning '$p' has characters the tool does not accept"
+    EXI_PART[$i]="$p"
+}
+
+exi_build_sql() { # i -> one transaction
+    local i="$1" T; T="$(tbl_expr TARGET "${TGT_T[$i]}")"
+    local cols_q; cols_q="$(quote_cols "${COMMON[$i]}")"
+    local sql; sql="$(duck_head)
+BEGIN;
+CREATE SCHEMA IF NOT EXISTS tgt.\"$TARGET_SCHEMA\";
+"
+    case "${EXI_ACTION[$i]}" in
+        rename) sql+="ALTER TABLE $T RENAME TO \"${BK_NAME[$i]}\";
+" ;;
+        drop)   sql+="DROP TABLE $T;
+" ;;
+    esac
+    sql+="CREATE TABLE $T (${EXI_COLDEF[$i]});
+"
+    [ -z "${EXI_PART[$i]}" ] || sql+="ALTER TABLE $T SET PARTITIONED BY (${EXI_PART[$i]});
+"
+    sql+="INSERT INTO $T ($cols_q) SELECT $cols_q FROM $(tbl_expr SOURCE "${SRC_T[$i]}");
+SELECT CASE WHEN (SELECT count(*) FROM $T) = ${SRC_CNT[$i]}
+            THEN 'RESULT,' || ${SRC_CNT[$i]}
+            ELSE error('row count check failed: expected ${SRC_CNT[$i]}') END;
+"
+    [ "${EXI_ACTION[$i]}" != rename ] || sql+="SELECT 'BACKUP,' || count(*) FROM tgt.\"$TARGET_SCHEMA\".\"${BK_NAME[$i]}\";
+"
+    if [ "$DRY_RUN" = yes ]; then sql+="ROLLBACK;"; else sql+="COMMIT;"; fi
+    printf '%s\n' "$sql"
+}
+
+exi_run() {
+    local d="$SOURCE_EXPORT_DIR" i out
+    [ -f "$d/MANIFEST.sha256" ] || die "no MANIFEST.sha256 in $d: not a complete export made by export-period.sh. Nothing was changed."
+    log "checking the export in $d: sha256 of $(wc -l <"$d/MANIFEST.sha256") files"
+    (cd "$d" && sha256sum -c --quiet MANIFEST.sha256) || die "the export is damaged or not fully copied (see the lines above). Copy it again. Nothing was changed."
+    log "    checksums OK"
+    for i in "${!SRC_T[@]}"; do exi_read_table "$i"; done
+    # which target tables exist, and how many rows they hold now
+    out="$(duck_run "$(duck_head)
+SELECT 'TEXISTS,' || table_name FROM information_schema.tables WHERE table_catalog = 'tgt' AND table_schema = '$(sqlq "$TARGET_SCHEMA")';")" \
+        || die "DuckDB could not list the target tables (see the error above)"
+    local sql="$(duck_head)"$'\n' any=no
+    for i in "${!SRC_T[@]}"; do
+        BK_NAME[$i]=""; TGT_CNT[$i]=0
+        if grep -qxF -- "TEXISTS,${TGT_T[$i]}" <<<"$out"; then
+            if [ "$BACKUP" = on ]; then
+                local suffix="_bak_$RUN_TS" base="${TGT_T[$i]}"
+                EXI_ACTION[$i]=rename; BK_NAME[$i]="${base:0:$((63 - ${#suffix}))}$suffix"
+            else
+                EXI_ACTION[$i]=drop
+            fi
+            sql+="SELECT 'TCNT,$i,' || count(*) FROM $(tbl_expr TARGET "${TGT_T[$i]}");"$'\n'; any=yes
+        else
+            EXI_ACTION[$i]=create
+        fi
+    done
+    if [ "$any" = yes ]; then
+        local tag idx n cnts
+        cnts="$(duck_run "$sql")" || die "DuckDB could not count the rows of the target tables (see the error above)"
+        while IFS=, read -r tag idx n; do [ "$tag" != TCNT ] || TGT_CNT[$idx]="$n"; done <<<"$cnts"
+    fi
+    echo
+    printf '%-4s %-34s %-34s %12s %12s  %-22s %s\n' "#" "EXPORTED TABLE" "TARGET TABLE" "EXPORT ROWS" "TARGET NOW" "PERIOD" "ACTION"
+    for i in "${!SRC_T[@]}"; do
+        local act
+        case "${EXI_ACTION[$i]}" in
+            create) act="CREATE (new)" ;;
+            rename) act="REPLACE: old table renamed to ${BK_NAME[$i]}" ;;
+            drop)   act="REPLACE: old table DROPPED (BACKUP=off)" ;;
+        esac
+        printf '%-4s %-34s %-34s %12s %12s  %-22s %s\n' "$((i+1))" "${SRC_T[$i]}" "$TARGET_SCHEMA.${TGT_T[$i]}" "${SRC_CNT[$i]}" "${TGT_CNT[$i]}" "${EXI_PERIOD[$i]}" "$act"
+    done
+    echo
+    echo "Every table above is replaced WHOLE by the exported rows (only the exported period remains in it), created with the export's columns, types$([ "$TARGET_TYPE" = ducklake ] && echo ' and partitioning'); one transaction per table."
+    [ "$BACKUP" = on ] || echo "BACKUP=off: existing target tables are DROPPED, their rows are not kept anywhere."
+    [ "$CHECK_ONLY" = no ] || { log "check only: nothing was changed"; exit 0; }
+    confirm_target
+
+    local failed=0 rc start
+    for i in "${!SRC_T[@]}"; do
+        log "[$((i+1))/${#SRC_T[@]}] ${SRC_T[$i]} -> $TARGET_SCHEMA.${TGT_T[$i]} (${EXI_ACTION[$i]})"
+        rc=0; start=$SECONDS
+        out="$(duck_run "$(exi_build_sql "$i")")" || rc=$?
+        SECS[$i]=$((SECONDS - start))
+        AFTER[$i]="$(grep -m1 '^RESULT,' <<<"$out" | cut -d, -f2 || true)"
+        BKROWS[$i]="$(grep -m1 '^BACKUP,' <<<"$out" | cut -d, -f2 || true)"; BKROWS[$i]="${BKROWS[$i]:--}"
+        MODE[$i]="export-${MODE[$i]}+${EXI_ACTION[$i]}"
+        if [ "$rc" -eq 0 ] && [ -n "${AFTER[$i]}" ]; then
+            STATUS[$i]="$([ "$DRY_RUN" = yes ] && echo 'DRY-RUN OK (rolled back)' || echo OK)"; MSG[$i]=""
+            log "    ${STATUS[$i]}: ${AFTER[$i]} rows$([ -n "${BK_NAME[$i]}" ] && echo ", old table kept as $TARGET_SCHEMA.${BK_NAME[$i]} (${BKROWS[$i]} rows)"), ${SECS[$i]}s"
+        else
+            STATUS[$i]=FAILED; MSG[$i]="exit code $rc; the transaction was rolled back, the old table is unchanged (see the error above)"
+            failed=$((failed+1)); log "    FAILED: ${MSG[$i]}"
+            [ "$ON_ERROR" = continue ] || break
+        fi
+    done
+    write_summary
+    if [ "$failed" -gt 0 ]; then log "finished with $failed failed table(s)"; exit 1; fi
+    log "finished: all tables OK"
+}
+
 write_summary() {
     local f="$RUN_DIR/summary.csv" i
     echo "table_source,table_target,mode,source_rows,target_rows_before,backup_table,backup_rows,target_rows_after,status,seconds,message" >"$f"
@@ -946,6 +1092,7 @@ main() {
     fi
     [ "$BACKUP" = on ] || [ "$EXPORT_ONLY" = yes ] || warn "BACKUP=off: the rows that are replaced will NOT be saved anywhere"
 
+    if [ "$SOURCE_TYPE" = export ]; then exi_run; return; fi
     [ "$SOURCE_TYPE" != flightsql ] || flight_probe_all
     if [ "$EXPORT_ONLY" = yes ]; then
         [ "$CHECK_ONLY" = no ] || { log "check only: nothing was exported"; exit 0; }
