@@ -102,6 +102,7 @@ hasnt "append: no delete"        "DELETE FROM" "$PG"
 hasnt "no backup: no backup table" "CREATE TABLE" "$PG"
 
 echo "generated SQL (DuckDB engine)"
+CREATE=(); CREATE_MISSING=yes
 OFFLINE=yes; BUNDLE_DIR=/opt/db-import/bundle; DUCK_EXTS="postgres ducklake"
 SOURCE_TYPE=ducklake; SOURCE_DB=ducklake; SOURCE_DUCKLAKE_DATA_PATH=/mnt/mfs/gsb_data/duckdb/ducklake; SOURCE_DUCKLAKE_METADATA_SCHEMA=metadata
 SOURCE_SCHEMA=gsb_data_kpi_pivot_dev
@@ -122,6 +123,11 @@ has "duck: time zone from config" "SET TimeZone='Australia/Sydney';" "$(build_du
 has "pg: time zone from config"   'PGTZ=Australia/Sydney psql' "$(DRY_RUN=no; build_pg_sql 0 "$T")"
 fails "bad time zone refused"      check_re TIMEZONE 'Aus tralia;x' '^[A-Za-z0-9_/+-]+$'
 TIMEZONE=UTC
+CREATE=(yes); DKC="$(build_duck_sql 0)"
+has "duck create: schema if missing"     "CREATE SCHEMA IF NOT EXISTS tgt.\"gsb_data\";" "$DKC"
+has "duck create: table like the source" 'AS SELECT * FROM src."gsb_data_kpi_pivot_dev"."KPI_X" WHERE 1 = 0;' "$DKC"
+has "duck create: inside the transaction" "$(printf 'BEGIN;\nCREATE SCHEMA IF NOT EXISTS tgt.')" "$DKC"
+CREATE=(); hasnt "duck: no create when the table exists" 'WHERE 1 = 0' "$(build_duck_sql 0)"
 has "duck: attach ducklake read only" "AS src (DATA_PATH '/mnt/mfs/gsb_data/duckdb/ducklake', METADATA_SCHEMA 'metadata', READ_ONLY);" "$DK"
 has "duck: password quoted for libpq and SQL" "password=''p\\''w d'''" "$DK"
 has "duck: insert"               'INSERT INTO tgt."gsb_data"."KPI_X" ("ID", "PERIOD_START_TIME", "V") SELECT "ID", "PERIOD_START_TIME", "V" FROM src."gsb_data_kpi_pivot_dev"."KPI_X" WHERE' "$DK"

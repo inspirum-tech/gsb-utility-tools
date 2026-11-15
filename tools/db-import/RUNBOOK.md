@@ -155,6 +155,7 @@ The target table must already exist. The tool never creates tables.
 | | `stop` | refuse if the target already has rows for the period |
 | `BACKUP` | `on` (default) / `off` | on: the replaced rows are first saved in the **target database** as `<BACKUP_SCHEMA>."<table>_bak_<date_time>"`. off: no backup, a warning is printed |
 | `BACKUP_SCHEMA` | default `import_backup` | the schema for the backup tables |
+| `CREATE_MISSING` | `yes` (default) / `no` | yes: a target schema or table that does not exist is created like the source (same columns and types) in the same transaction as the import; the plan shows `(NEW)` and the log `created target table ...`. no: a missing target table stops the run before anything is written |
 | `ON_ERROR` | `stop` (default) / `continue` | stop at the first failed table, or go on with the next one (the failed table is rolled back either way) |
 | `FULL_COPY_TABLES` | table names | for a table with **no time column** that must be replaced whole. A table without the time column that is not listed stops the run |
 | `TABLE_TIME_COLUMNS` | `TABLE:COLUMN,TABLE:COLUMN` | only for a table whose time column has a different name |

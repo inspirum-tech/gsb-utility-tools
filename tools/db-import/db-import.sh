@@ -202,6 +202,12 @@ pg_cols() { # side schema table
     pg_run "$1" -c "SELECT column_name FROM information_schema.columns WHERE table_schema='$2' AND table_name='$3' ORDER BY ordinal_position"
 }
 
+pg_coldefs() { # side schema table -> 'col type, col type, ...' as the source defines them (to create the same table on the target)
+    pg_run "$1" -c "SELECT string_agg(format('%I %s', a.attname, format_type(a.atttypid, a.atttypmod)), ', ' ORDER BY a.attnum)
+                     FROM pg_attribute a JOIN pg_class c ON c.oid = a.attrelid JOIN pg_namespace n ON n.oid = c.relnamespace
+                     WHERE n.nspname = '$2' AND c.relname = '$3' AND a.attnum > 0 AND NOT a.attisdropped"
+}
+
 pg_count() { # side schema table where
     pg_run "$1" -c "SELECT count(*) FROM \"$2\".\"$3\" $4"
 }
@@ -219,6 +225,11 @@ build_pg_sql() { # i tmpdir -> the SQL the target psql runs (one transaction)
     local sql="\\set ON_ERROR_STOP on
 BEGIN;
 "
+    if [ "${CREATE[$i]:-}" = yes ]; then          # the target table does not exist: create it like the source, in the same transaction
+        sql+="CREATE SCHEMA IF NOT EXISTS \"$TARGET_SCHEMA\";
+CREATE TABLE \"$TARGET_SCHEMA\".\"$tt\" (${TDEF[$i]});
+"
+    fi
     if [ -n "${BK_NAME[$i]}" ]; then
         sql+="CREATE SCHEMA IF NOT EXISTS \"$BACKUP_SCHEMA\";
 CREATE TABLE \"$BACKUP_SCHEMA\".\"${BK_NAME[$i]}\" AS SELECT * FROM \"$TARGET_SCHEMA\".\"$tt\" $w;
@@ -309,6 +320,11 @@ build_duck_sql() { # i -> one transaction
     local sql; sql="$(duck_head)
 BEGIN;
 "
+    if [ "${CREATE[$i]:-}" = yes ]; then          # the target table does not exist: create it like the source, in the same transaction
+        sql+="CREATE SCHEMA IF NOT EXISTS tgt.\"$TARGET_SCHEMA\";
+CREATE TABLE $T AS SELECT * FROM $S WHERE 1 = 0;
+"
+    fi
     if [ -n "${BK_NAME[$i]}" ]; then
         sql+="CREATE SCHEMA IF NOT EXISTS tgt.\"$BACKUP_SCHEMA\";
 CREATE TABLE tgt.\"$BACKUP_SCHEMA\".\"${BK_NAME[$i]}\" AS SELECT * FROM $T $w;
@@ -388,7 +404,7 @@ setup_duck() {
 # ---------------------------------------------------------------------------------------------
 # Config, preflight, execution
 # ---------------------------------------------------------------------------------------------
-declare -a SRC_T TGT_T SRC_COLS TGT_COLS COMMON MODE TC WHERE SRC_CNT TGT_CNT EXPECT BK_NAME
+declare -a SRC_T TGT_T SRC_COLS TGT_COLS COMMON MODE TC WHERE SRC_CNT TGT_CNT EXPECT BK_NAME CREATE TDEF
 declare -a STATUS AFTER BKROWS SECS MSG
 
 # ---------------------------------------------------------------------------------------------
@@ -534,7 +550,7 @@ load_config() {
     : "${SOURCE_PORT:=}" "${TARGET_PORT:=}"
     : "${SOURCE_DUCKLAKE_METADATA_SCHEMA:=metadata}" "${TARGET_DUCKLAKE_METADATA_SCHEMA:=metadata}"
     : "${SOURCE_SCHEMA:=}" "${TARGET_SCHEMA:=${SOURCE_SCHEMA}}"
-    : "${LOAD_MODE:=replace}" "${BACKUP:=on}" "${BACKUP_SCHEMA:=import_backup}"
+    : "${LOAD_MODE:=replace}" "${BACKUP:=on}" "${BACKUP_SCHEMA:=import_backup}" "${CREATE_MISSING:=yes}"
     : "${TIME_COLUMN:=PERIOD_START_TIME}" "${TABLE_TIME_COLUMNS:=}" "${FULL_COPY_TABLES:=}"
     : "${PERIOD_FROM:=}" "${PERIOD_TO:=}" "${TABLES:=}" "${ON_ERROR:=stop}"
     : "${TIMEZONE:=UTC}"
@@ -557,6 +573,7 @@ validate_config() {
     fi
     case "$LOAD_MODE" in replace|append|stop) ;; *) die "LOAD_MODE must be replace, append or stop";; esac
     case "$BACKUP" in on|off) ;; *) die "BACKUP must be on or off";; esac
+    case "$CREATE_MISSING" in yes|no) ;; *) die "CREATE_MISSING must be yes or no";; esac
     case "$ON_ERROR" in stop|continue) ;; *) die "ON_ERROR must be stop or continue";; esac
     case "$OFFLINE" in yes|no) ;; *) die "OFFLINE must be yes or no";; esac
     [ -z "$DUCKDB_EXTENSION_DIR" ] || check_re DUCKDB_EXTENSION_DIR "$DUCKDB_EXTENSION_DIR" "$re_path"
@@ -605,18 +622,33 @@ preflight_cols() {
             [ -n "$out" ] || die "source table $SOURCE_SCHEMA.${SRC_T[$i]} does not exist (or has no columns)"
             SRC_COLS[$i]="$out"
             out="$(pg_cols TARGET "$TARGET_SCHEMA" "${TGT_T[$i]}")" || die "cannot read the columns of the target (see the error above)"
-            [ -n "$out" ] || die "target table $TARGET_SCHEMA.${TGT_T[$i]} does not exist. The script never creates the target table."
-            TGT_COLS[$i]="$out"
+            if [ -n "$out" ]; then
+                TGT_COLS[$i]="$out"
+            else
+                mark_create "$i"
+                TDEF[$i]="$(pg_coldefs SOURCE "$SOURCE_SCHEMA" "${SRC_T[$i]}")" || die "cannot read the column types of the source table ${SRC_T[$i]}"
+                [ -n "${TDEF[$i]}" ] || die "no column definition came back for the source table ${SRC_T[$i]}"
+            fi
         done
     else
-        local sql line tag idx col; sql="$(duck_head)"$'\n'
+        # which target tables exist (a missing one is created later when CREATE_MISSING=yes, else refused)
+        local sql line tag idx col existing
+        sql="$(duck_head)
+SELECT 'TEXISTS,' || table_name FROM information_schema.tables WHERE table_catalog = 'tgt' AND table_schema = '$(sqlq "$TARGET_SCHEMA")';
+"
+        existing="$(duck_run "$sql")" || die "DuckDB could not list the target tables (see the error above)"
+        sql="$(duck_head)"$'\n'
         for i in "${!SRC_T[@]}"; do
             if [ "$SOURCE_TYPE" != flightsql ]; then      # flightsql: the source columns came from flight_probe_all
                 sql+="SELECT 'SCOL,$i,' || column_name FROM (DESCRIBE SELECT * FROM $(tbl_expr SOURCE "${SRC_T[$i]}"));
 "
             fi
-            sql+="SELECT 'TCOL,$i,' || column_name FROM (DESCRIBE SELECT * FROM $(tbl_expr TARGET "${TGT_T[$i]}"));
+            if grep -qxF -- "TEXISTS,${TGT_T[$i]}" <<<"$existing"; then
+                sql+="SELECT 'TCOL,$i,' || column_name FROM (DESCRIBE SELECT * FROM $(tbl_expr TARGET "${TGT_T[$i]}"));
 "
+            else
+                CREATE[$i]=pending
+            fi
         done
         out="$(duck_run "$sql")" || die "DuckDB could not read the table columns (see the error above)"
         for i in "${!SRC_T[@]}"; do
@@ -630,10 +662,20 @@ preflight_cols() {
             esac
         done <<<"$out"
         for i in "${!SRC_T[@]}"; do
-            [ -n "${SRC_COLS[$i]}" ] || die "source table ${SRC_T[$i]} has no columns"
-            [ -n "${TGT_COLS[$i]}" ] || die "target table ${TGT_T[$i]} has no columns"
+            [ -n "${SRC_COLS[$i]}" ] || die "source table ${SRC_T[$i]} does not exist or has no columns"
+            if [ "${CREATE[$i]:-}" = pending ]; then mark_create "$i"
+            else [ -n "${TGT_COLS[$i]}" ] || die "target table ${TGT_T[$i]} has no columns"; fi
         done
     fi
+}
+
+mark_create() { # i : the target table is missing -> create it like the source (or refuse)
+    local i="$1"
+    [ "$CREATE_MISSING" = yes ] \
+        || die "target table $TARGET_SCHEMA.${TGT_T[$i]} does not exist (CREATE_MISSING=no: create it first, or set CREATE_MISSING=\"yes\" to have it created like the source)"
+    CREATE[$i]=yes
+    TGT_COLS[$i]="${SRC_COLS[$i]}"       # it will have exactly the source columns
+    log "    target $TARGET_SCHEMA.${TGT_T[$i]} does not exist: it will be CREATED like the source ${SRC_T[$i]} (same columns and types), in the same transaction as its import"
 }
 
 has_col() { grep -qxF -- "$2" <<<"$1"; }
@@ -680,7 +722,8 @@ preflight_counts() {
     if [ "$ENGINE" = pg ]; then
         for i in "${!SRC_T[@]}"; do
             SRC_CNT[$i]="$(pg_count SOURCE "$SOURCE_SCHEMA" "${SRC_T[$i]}" "${WHERE[$i]}")" || die "source count failed"
-            TGT_CNT[$i]="$(pg_count TARGET "$TARGET_SCHEMA" "${TGT_T[$i]}" "${WHERE[$i]}")" || die "target count failed"
+            if [ "${CREATE[$i]:-}" = yes ]; then TGT_CNT[$i]=0
+            else TGT_CNT[$i]="$(pg_count TARGET "$TARGET_SCHEMA" "${TGT_T[$i]}" "${WHERE[$i]}")" || die "target count failed"; fi
         done
     else
         local sql tag idx s t; sql="$(duck_head)"$'\n'
@@ -688,7 +731,9 @@ preflight_counts() {
             local scnt
             if [ "$SOURCE_TYPE" = flightsql ]; then scnt="'${SRC_CNT[$i]}'"    # counted through the API by flight_probe_all, or '-' (counted during the export)
             else scnt="(SELECT count(*) FROM $(tbl_expr SOURCE "${SRC_T[$i]}") ${WHERE[$i]})"; fi
-            sql+="SELECT 'CNT,$i,' || $scnt || ',' || (SELECT count(*) FROM $(tbl_expr TARGET "${TGT_T[$i]}") ${WHERE[$i]});
+            local tcnt="(SELECT count(*) FROM $(tbl_expr TARGET "${TGT_T[$i]}") ${WHERE[$i]})"
+            [ "${CREATE[$i]:-}" != yes ] || tcnt="0"                # the target table does not exist yet
+            sql+="SELECT 'CNT,$i,' || $scnt || ',' || $tcnt;
 "
         done
         out="$(duck_run "$sql")" || die "DuckDB count failed (see the error above)"
@@ -721,10 +766,12 @@ print_plan() {
     echo
     printf '%-4s %-34s %-34s %-7s %12s %12s  %s\n' "#" "SOURCE TABLE" "TARGET TABLE" "MODE" "SOURCE ROWS" "TARGET ROWS" "BACKUP"
     for i in "${!SRC_T[@]}"; do
-        printf '%-4s %-34s %-34s %-7s %12s %12s  %s\n' "$((i+1))" "${SRC_T[$i]}" "${TGT_T[$i]}" "${MODE[$i]}" \
+        printf '%-4s %-34s %-34s %-7s %12s %12s  %s\n' "$((i+1))" "${SRC_T[$i]}" "${TGT_T[$i]}$([ "${CREATE[$i]:-}" = yes ] && echo ' (NEW)')" "${MODE[$i]}" \
             "${SRC_CNT[$i]}" "${TGT_CNT[$i]}" "${BK_NAME[$i]:--}"
     done
     echo
+    local n=0; for i in "${!SRC_T[@]}"; do [ "${CREATE[$i]:-}" != yes ] || n=$((n+1)); done
+    [ "$n" -eq 0 ] || echo "(NEW): $n target table(s) do not exist and will be created in schema \"$TARGET_SCHEMA\" (schema too, if missing) with the source's columns and types, each in the same transaction as its import."
     case "$LOAD_MODE" in
         replace) echo "LOAD_MODE=replace: target rows in the period are deleted, then the source rows are inserted." ;;
         append)  echo "LOAD_MODE=append: source rows are inserted, nothing is deleted (running twice gives duplicates)." ;;
@@ -769,7 +816,7 @@ write_summary() {
     local f="$RUN_DIR/summary.csv" i
     echo "table_source,table_target,mode,source_rows,target_rows_before,backup_table,backup_rows,target_rows_after,status,seconds,message" >"$f"
     for i in "${!SRC_T[@]}"; do
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "${SRC_T[$i]}" "${TGT_T[$i]}" "${MODE[$i]}" "${SRC_CNT[$i]}" "${TGT_CNT[$i]}" \
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "${SRC_T[$i]}" "${TGT_T[$i]}" "${MODE[$i]}$([ "${CREATE[$i]:-}" = yes ] && echo '+create')" "${SRC_CNT[$i]}" "${TGT_CNT[$i]}" \
             "${BK_NAME[$i]:--}" "${BKROWS[$i]:--}" "${AFTER[$i]:--}" "${STATUS[$i]:-NOT RUN}" "${SECS[$i]:--}" "${MSG[$i]:-}" >>"$f"
     done
     log "summary: $f"
@@ -856,6 +903,7 @@ main() {
         fi
         if run_table "$i"; then
             [ "$SOURCE_TYPE" = flightsql ] && [ "$DRY_RUN" = no ] && flight_write_marker "$i"
+            [ "${CREATE[$i]:-}" != yes ] || log "    created target table $TARGET_SCHEMA.${TGT_T[$i]}$([ "$DRY_RUN" = yes ] && echo ' (dry-run: rolled back)')"
             log "    ${STATUS[$i]}: target rows in the period ${TGT_CNT[$i]} -> ${AFTER[$i]} (source ${SRC_CNT[$i]}), backup rows ${BKROWS[$i]}, ${SECS[$i]}s"
         else
             failed=$((failed+1)); log "    FAILED: ${MSG[$i]}"

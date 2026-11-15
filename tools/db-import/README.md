@@ -78,7 +78,8 @@ Everything is in the config file; [config.example.env](config.example.env) docum
 |---|---|
 | `SOURCE_*`, `TARGET_*` | type, host, port, database, user, schema, and `*_PASSWORD_ENV` (the **name** of an environment variable holding the password; empty = `~/.pgpass`). Never put a password in the file |
 | `TARGET_ENV` | `dev`, `uat` or `prod`. For `prod` the script asks you to type the database name (or pass `--yes`) |
-| `TABLES` | `A,B` or `SOURCE=TARGET`. Target tables must already exist (the script never creates them) |
+| `TABLES` | `A,B` or `SOURCE=TARGET`. A target table (or schema) that does not exist is created like the source, see `CREATE_MISSING` |
+| `CREATE_MISSING` | `yes` (default): a missing target schema / table is created with the source's columns and types, inside the same transaction as its import; the plan marks it `(NEW)`. `no`: a missing table stops the run |
 | `PERIOD_FROM`, `PERIOD_TO` | `PERIOD_FROM <= TIME_COLUMN < PERIOD_TO`. A date alone = 00:00:00; `YYYY-MM-DD HH:MM[:SS]` also accepted; anything else is refused |
 | `TIMEZONE` | default `UTC`. The zone the period is written in and the zone used for `timestamp with time zone` columns (also when copying them into a plain `timestamp` column). The gsb pivot data is Sydney time, so use `Australia/Sydney`. Found on dev: DuckLake `PERIOD_START_TIME` is `timestamptz`, the Postgres OLD one is a plain `timestamp` |
 | `TIME_COLUMN` | default `PERIOD_START_TIME` (checked on dev for the 24 `KPI_NS_QRLY_*_ERS_P` tables). `TABLE_TIME_COLUMNS=T:COL` for a table that differs |
@@ -91,8 +92,9 @@ Everything is in the config file; [config.example.env](config.example.env) docum
 
 ## Safety checks (before anything is written)
 
-Config valid and no password in it, period valid, source != target table, every table exists on both sides, every source column is in
-the target, time column on both sides, row counts printed, bundle checked (DuckDB engine), confirmation for a prod target.
+Config valid and no password in it, period valid, source != target table, every source table exists, every source column is in
+the target (or the target table is missing and will be created like the source: `CREATE_MISSING`), time column on both sides,
+row counts printed, bundle / extensions checked (DuckDB engine), confirmation for a prod target.
 Any problem stops the run with a message and **nothing changed**.
 
 ## What a run leaves behind
