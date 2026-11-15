@@ -211,6 +211,37 @@ class T(unittest.TestCase):
         finally:
             shutil.rmtree(d)
 
+    def test_page_size_is_half_the_cap(self):
+        self.assertEqual(fx.page_size(500000), 250000)
+        self.assertEqual(fx.page_size(1), 1)
+
+    def test_read_in_pages_adds_up_and_checks_count(self):
+        try:
+            import pyarrow as pa
+        except ImportError:
+            self.skipTest("pyarrow not installed here")
+        rows = 7
+
+        class FakeCon:
+            def __init__(self, count): self.count, self.sql = count, []
+            def run(self, sql):
+                self.sql.append(sql)
+                if sql.startswith("SELECT count(*)"):
+                    return pa.table({"n": [self.count]})
+                import re
+                lim, off = map(int, re.search(r"LIMIT (\d+) OFFSET (\d+)", sql).groups())
+                ids = list(range(off, min(off + lim, rows)))
+                return pa.table({"ID": ids})
+
+        c = FakeCon(rows)
+        t = fx.read_in_pages(c, 's."T"', "x", 4)          # pages of 2 -> 4 pages (2,2,2,1)
+        self.assertEqual(t.column("ID").to_pylist(), list(range(rows)))
+        self.assertEqual(sum(1 for s in c.sql if "ORDER BY ALL" in s), 4)
+        self.assertIn("ORDER BY ALL LIMIT 2 OFFSET 2", c.sql[1])
+        with self.assertRaises(fx.HelperError) as cm:
+            fx.read_in_pages(FakeCon(rows + 1), 's."T"', "x", 4)   # count disagrees -> refuse
+        self.assertEqual(cm.exception.code, 3)
+
     def test_slice_file_names_sort_in_order(self):
         names = [fx.slice_file_name(i, "aware", dt.datetime(2026, 1, 1, tzinfo=UTC)) for i in (1, 2, 10, 100)]
         self.assertEqual(names, sorted(names))

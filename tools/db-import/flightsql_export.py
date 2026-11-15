@@ -14,7 +14,10 @@ Commands (all read-only towards the API):
   probe   read the table structure (SELECT ... LIMIT 0); with --count also count the rows of the
           window, in chunks of --count-minutes (one count(*) over days of data times out on the
           big tables; a count costs about as much as the read itself, so it is off by default)
-  export  probe, then read the window slice by slice and write the parquet files. RESUMES: a slice
+  export  probe, then read the window slice by slice and write the parquet files. A slice that comes
+          back with --max-rows rows (the API's cap, which cuts silently) is read again in pages of
+          half the cap with ORDER BY ALL LIMIT/OFFSET and checked against count(*) (--split-on-cap);
+          without that option the slice fails (exit 3). RESUMES: a slice
           whose file is already in the folder (same table, window, time zone and slice length,
           recorded in _PLAN.json) is kept and not asked again; only the missing slices are read.
           A folder made for another window / slice length is refused (use --overwrite or another folder).
@@ -301,6 +304,32 @@ def existing_export(out_dir, plan, overwrite):
     return "resume"
 
 
+def page_size(max_rows):
+    """Pages are half the cap, so a full page is never mistaken for a cut one."""
+    return max(1, max_rows // 2)
+
+
+def read_in_pages(con, ref, where, max_rows):
+    """A slice that reached the API's row cap, read again in pages of max_rows/2 rows with a fixed order
+    (ORDER BY ALL), then checked against count(*) of the same slice: the pages must add up exactly.
+    One time stamp cannot be split by time, so this is the only way to read it completely."""
+    import pyarrow as pa
+    size, offset, parts = page_size(max_rows), 0, []
+    while True:
+        part = con.run("SELECT * FROM %s WHERE %s ORDER BY ALL LIMIT %d OFFSET %d" % (ref, where, size, offset))
+        parts.append(part)
+        offset += part.num_rows
+        if part.num_rows < size:
+            break
+    table = pa.concat_tables(parts)
+    expected = con.run("SELECT count(*) AS n FROM %s WHERE %s" % (ref, where)).to_pylist()[0]["n"]
+    if table.num_rows != expected:
+        raise HelperError("paged read of a slice gave %d rows but count(*) says %d (the data changed while it was read, or the "
+                          "API did not honour LIMIT/OFFSET). Nothing was imported; run again." % (table.num_rows, expected), 3)
+    err("  paged read complete: %d rows in %d pages of up to %d, equal to count(*)" % (table.num_rows, len(parts), size))
+    return table
+
+
 def export(con, args, col, kind):
     import pyarrow.parquet as pq
     ref = table_ref(args.schema, args.table)
@@ -323,18 +352,25 @@ def export(con, args, col, kind):
             total += n; kept += 1
             print("SLICE,%d,%d,%d,kept" % (i, len(slices), n), flush=True)
             continue
-        table = con.run("SELECT * FROM %s WHERE %s" % (ref, where_clause(kind, col, lo, hi)))
-        n = table.num_rows
+        where = where_clause(kind, col, lo, hi)
+        table = con.run("SELECT * FROM %s WHERE %s" % (ref, where))
+        n, how = table.num_rows, "new"
         if n >= args.max_rows:
-            raise HelperError(
-                "slice %d of %d (%s) returned %d rows, which is the row cap (%d): the API may have cut the result. "
-                "Nothing was imported. Lower FLIGHT_SLICE_MINUTES (now %d) and run again."
-                % (i, len(slices), lo.strftime(FMT), n, args.max_rows, args.slice_minutes), 3)
+            # the API cuts a result at its row cap silently: this slice may be incomplete
+            if not args.split_on_cap:
+                raise HelperError(
+                    "slice %d of %d (%s) returned %d rows, which is the row cap (%d): the API may have cut the result. "
+                    "Nothing was imported. Lower FLIGHT_SLICE_MINUTES (now %d) and run again."
+                    % (i, len(slices), lo.strftime(FMT), n, args.max_rows, args.slice_minutes), 3)
+            err("  slice %d of %d (%s): %d rows = the API row cap, the result may be cut: reading it again in pages"
+                % (i, len(slices), lo.strftime(FMT), n))
+            table = read_in_pages(con, ref, where, args.max_rows)
+            n, how = table.num_rows, "paged"
         tmp = final + ".tmp"
         pq.write_table(table, tmp)
         os.replace(tmp, final)             # a slice file is either complete or absent
         total += n; fetched += 1
-        print("SLICE,%d,%d,%d,new" % (i, len(slices), n), flush=True)
+        print("SLICE,%d,%d,%d,%s" % (i, len(slices), n, how), flush=True)
         if i < len(slices) and args.pause_seconds > 0:
             time.sleep(args.pause_seconds)
     if kept:
@@ -365,6 +401,7 @@ def parse_args(argv):
     p.add_argument("--timeout-seconds", type=int, default=120)
     p.add_argument("--retries", type=int, default=3, help="retries of a query after a time limit or network error")
     p.add_argument("--max-msg-mb", type=int, default=1024, help="largest gRPC message the client accepts, in MiB (driver default 16)")
+    p.add_argument("--split-on-cap", action="store_true", help="a slice that reaches --max-rows is read again in pages and checked with count(*), instead of failing")
     p.add_argument("--retry-wait", type=float, default=5, help="seconds before the first retry; doubled each time")
     p.add_argument("--out-dir", help="export only: parent folder; files go to <out-dir>/<table>/")
     p.add_argument("--overwrite", action="store_true")

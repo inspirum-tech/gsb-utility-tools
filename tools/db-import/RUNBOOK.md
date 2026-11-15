@@ -191,6 +191,8 @@ The tool asks the API for the period in small time slices, saves them as parquet
 | `FLIGHT_SLICE_MINUTES` | length of one time slice (15 = exactly one quarter-hour timestamp per slice for the `QRLY` tables) | 15 |
 | `FLIGHT_COUNT` | `no`: the source rows are counted while they are read, `--check` and the plan show `-` for them (a count through the API costs as much as the read itself). `yes`: count first, in chunks | no |
 | `FLIGHT_COUNT_MINUTES` | with `FLIGHT_COUNT=yes`: the count is done in chunks of this many minutes and added up; one `count(*)` over days of a big table exceeds the API time limit. 0 = same as `FLIGHT_SLICE_MINUTES` | 0 |
+| `FLIGHT_PARALLEL_TABLES` | how many tables are read at the same time. 1 = one after the other with per-slice progress on screen; more = one line per table when it starts and ends, per-slice progress in `reports/<run>/export_<TABLE>.log`. Each uses one of the API's 25 pooled connections, which its other users share | 4 |
+| `FLIGHT_SPLIT_ON_CAP` | a slice that returns exactly `FLIGHT_MAX_ROWS` rows may have been cut by the API. `yes`: that slice is read again in pages of half the cap (`ORDER BY ALL LIMIT/OFFSET`) and the pages are checked against `count(*)` of the slice; any difference fails the table. `no`: the table fails at once | yes |
 | `FLIGHT_MAX_MESSAGE_MB` | largest answer (one slice) the client accepts, in MiB. The driver's default is 16, which a 15-minute slice of a wide table exceeds (`received message larger than max`) | 1024 |
 | `FLIGHT_RETRIES` | how many times a query that hit the time limit or lost the connection (tunnel hiccup) is retried; the connection is re-opened first. Other errors are not retried | 3 |
 | `FLIGHT_RETRY_WAIT_SECONDS` | wait before the first retry, doubled each time (5, 10, 20 s) | 5 |
@@ -223,9 +225,7 @@ To import a table again on purpose, remove its `_IMPORTED` file (or set `EXPORT_
 - The time filter is built by the tool from the period (as exact UTC instants for columns with a time zone, as local time for columns without one). It is not the API's own time conversion, which shifts a plain filter by 11 hours on some tables. You do not need to do anything.
 - The query is always `SELECT * FROM <schema>."<table>" WHERE <time column> in the slice`. You choose tables and period; you cannot add other filters.
 - Only a time column of type timestamp is supported. Another type, or a table without the column, stops the run with a message.
-- The row cap: pick `FLIGHT_SLICE_MINUTES` so that one slice is far below `FLIGHT_MAX_ROWS`. If it still fails, lower it. The data of one single time stamp cannot be split further:
-  for a quarter-hourly table, rows in the period / (4 x 24 x days) = rows per time stamp; if that is at or above the cap, the table cannot be read through the API until its `FLIGHTSQL__MAX_ROWS` is raised.
-  `--check` prints the rows in the period per table, so you can do this sum before exporting.
+- The row cap: the API cuts a result at `FLIGHTSQL__MAX_ROWS` **silently**, so a slice that comes back with exactly that many rows is suspect. The tool never imports such a slice as it is: with `FLIGHT_SPLIT_ON_CAP=yes` (default) it reads the slice again in pages (`ORDER BY ALL LIMIT/OFFSET`, half the cap per page) and accepts it only if the pages add up to the slice's `count(*)`; with `no` the table fails. One time stamp cannot be split by time, which is why the pages are needed. Set `FLIGHT_MAX_ROWS` to the API's real cap (read it from the API log: `START max_rows=...`); a lower value only causes needless paging, a higher one would let a cut result through.
 - `TIMEOUT ... context deadline exceeded` during `--check`: the count of one chunk took longer than `FLIGHT_TIMEOUT_SECONDS`. The retries kick in first; if it still fails, lower `FLIGHT_COUNT_MINUTES` or raise the time limit.
 
 ## 4. Passwords

@@ -484,35 +484,89 @@ flight_probe_all() { # one structure read per table (plus a chunked count when F
     done
 }
 
-flight_export_all() { # reads every table slice by slice into EXPORT_DIR/<TABLE>/*.parquet
-    local i st tc tot ow=""
+flight_helper_args() { # i -> the export arguments of table i (one per line, for printf '%q')
+    local i="$1" st="${SRC_T[$1]}" tc; tc="$(tcol_for "$st")"
+    local ow="" split=""
     [ "$EXPORT_OVERWRITE" = yes ] && ow="--overwrite"
-    mkdir -p "$EXPORT_DIR"
-    log "exporting from the API: slices of $FLIGHT_SLICE_MINUTES min, pause $FLIGHT_PAUSE_SECONDS s, row cap $FLIGHT_MAX_ROWS, into $EXPORT_DIR"
-    [ "$EXPORT_OVERWRITE" = yes ] || log "    (slice files already in $EXPORT_DIR from an earlier run of the same period are kept: only the missing slices are read)"
+    [ "$FLIGHT_SPLIT_ON_CAP" = yes ] && split="--split-on-cap"
+    printf '%s\n' export --host "$SOURCE_HOST" --port "$SOURCE_PORT" --schema "$SOURCE_SCHEMA" --table "$st" \
+        --time-column "$tc" --from-local "$FROM_TS" --to-local "$TO_TS" --timezone "$TIMEZONE" \
+        --slice-minutes "$FLIGHT_SLICE_MINUTES" --pause-seconds "$FLIGHT_PAUSE_SECONDS" \
+        --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS" \
+        --retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS" --max-msg-mb "$FLIGHT_MAX_MESSAGE_MB" $split \
+        --out-dir "$EXPORT_DIR" $ow
+}
+
+flight_export_parallel() { # FLIGHT_PARALLEL_TABLES > 1: several tables at once, each helper's output to its own file; a summary per table when it ends
+    local i n=0 rc failed=0 running=() pid
+    declare -A PID_OF=()
+    log "exporting $(( ${#SRC_T[@]} )) tables, $FLIGHT_PARALLEL_TABLES at a time (per-slice progress is in $RUN_DIR/export_<TABLE>.log)"
     for i in "${!SRC_T[@]}"; do
-        st="${SRC_T[$i]}"; tc="$(tcol_for "$st")"
+        if [ -n "${SKIP[$i]:-}" ]; then log "    [$((i+1))/${#SRC_T[@]}] ${SRC_T[$i]}: ${SKIP[$i]}"; continue; fi
+        FL_EXPORTED+=" ${SRC_T[$i]}"
+        while [ "$(jobs -rp | wc -l)" -ge "$FLIGHT_PARALLEL_TABLES" ]; do sleep 2; flight_reap PID_OF; done
+        log "    [$((i+1))/${#SRC_T[@]}] ${SRC_T[$i]}: started"
+        local args=(); mapfile -t args < <(flight_helper_args "$i")
+        ( flight_py "${args[@]}" >"$TMP/fl_$i.out" 2>"$RUN_DIR/export_${SRC_T[$i]}.log"; echo $? >"$TMP/fl_$i.rc" ) &
+        PID_OF[$!]="$i"
+    done
+    while [ "$(jobs -rp | wc -l)" -gt 0 ]; do sleep 2; flight_reap PID_OF; done
+    flight_reap PID_OF
+    for i in "${!SRC_T[@]}"; do
+        [ -n "${SKIP[$i]:-}" ] && continue
+        rc="$(cat "$TMP/fl_$i.rc" 2>/dev/null || echo 1)"
+        if [ "$rc" != 0 ]; then failed=$((failed+1)); fi
+    done
+    [ "$failed" -eq 0 ] || die "reading $failed table(s) from the API stopped (details in $RUN_DIR/export_<TABLE>.log and above). Nothing was imported. Run again: the slices already on disk are kept."
+}
+
+flight_reap() { # -n PID_OF : report every helper that has finished since the last call
+    local -n map="$1"; local pid i
+    for pid in "${!map[@]}"; do
+        kill -0 "$pid" 2>/dev/null && continue
+        i="${map[$pid]}"; unset "map[$pid]"
+        local rc; rc="$(cat "$TMP/fl_$i.rc" 2>/dev/null || echo 1)"
+        if [ "$rc" = 0 ]; then
+            local kept paged tot; kept="$(grep -c ',kept$' "$TMP/fl_$i.out" || true)"; paged="$(grep -c ',paged$' "$TMP/fl_$i.out" || true)"
+            tot="$(grep -m1 '^TOTAL,' "$TMP/fl_$i.out" | cut -d, -f2 || true)"
+            log "    ${SRC_T[$i]}: finished, $tot rows, $(grep -c '^SLICE,' "$TMP/fl_$i.out" || true) slices ($kept kept from an earlier run, $paged read in pages)"
+            flight_take_total "$i"
+        else
+            log "    ${SRC_T[$i]}: FAILED (exit $rc): $(grep -m1 '^ERROR' "$RUN_DIR/export_${SRC_T[$i]}.log" || tail -1 "$RUN_DIR/export_${SRC_T[$i]}.log")"
+        fi
+    done
+}
+
+flight_export_all() { # reads every table slice by slice into EXPORT_DIR/<TABLE>/*.parquet
+    local i st
+    mkdir -p "$EXPORT_DIR"
+    log "exporting from the API: slices of $FLIGHT_SLICE_MINUTES min, pause $FLIGHT_PAUSE_SECONDS s, row cap $FLIGHT_MAX_ROWS$([ "$FLIGHT_SPLIT_ON_CAP" = yes ] && echo ' (a slice at the cap is read again in pages and checked)'), into $EXPORT_DIR"
+    [ "$EXPORT_OVERWRITE" = yes ] || log "    (slice files already in $EXPORT_DIR from an earlier run of the same period are kept: only the missing slices are read)"
+    if [ "$FLIGHT_PARALLEL_TABLES" -gt 1 ]; then flight_export_parallel; return; fi
+    for i in "${!SRC_T[@]}"; do
+        st="${SRC_T[$i]}"
         if [ -n "${SKIP[$i]:-}" ]; then log "    [$((i+1))/${#SRC_T[@]}] $st: ${SKIP[$i]}"; continue; fi
         FL_EXPORTED+=" $st"
         log "    [$((i+1))/${#SRC_T[@]}] $st"
-        if ! flight_py export --host "$SOURCE_HOST" --port "$SOURCE_PORT" --schema "$SOURCE_SCHEMA" --table "$st" \
-                --time-column "$tc" --from-local "$FROM_TS" --to-local "$TO_TS" --timezone "$TIMEZONE" \
-                --slice-minutes "$FLIGHT_SLICE_MINUTES" --pause-seconds "$FLIGHT_PAUSE_SECONDS" \
-                --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS" \
-                --retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS" --max-msg-mb "$FLIGHT_MAX_MESSAGE_MB" \
-                --out-dir "$EXPORT_DIR" $ow | tee "$TMP/fl_$i.out" | sed -n 's/^SLICE,\([0-9]*\),\([0-9]*\),\([0-9]*\),kept$/        slice \1 of \2: \3 rows (kept from an earlier run)/p; s/^SLICE,\([0-9]*\),\([0-9]*\),\([0-9]*\),new$/        slice \1 of \2: \3 rows/p'; then
+        local args=(); mapfile -t args < <(flight_helper_args "$i")
+        if ! flight_py "${args[@]}" | tee "$TMP/fl_$i.out" | sed -n 's/^SLICE,\([0-9]*\),\([0-9]*\),\([0-9]*\),kept$/        slice \1 of \2: \3 rows (kept from an earlier run)/p; s/^SLICE,\([0-9]*\),\([0-9]*\),\([0-9]*\),new$/        slice \1 of \2: \3 rows/p; s/^SLICE,\([0-9]*\),\([0-9]*\),\([0-9]*\),paged$/        slice \1 of \2: \3 rows (reached the API cap: read in pages, checked with count)/p'; then
             die "reading $st from the API stopped (the reason is in the error above). Nothing was imported."
         fi
-        tot="$(grep -m1 '^TOTAL,' "$TMP/fl_$i.out" | cut -d, -f2 || true)"
-        [[ "$tot" =~ ^[0-9]+$ ]] || die "Flight SQL export of $st did not report a total"
-        if [ "${SRC_CNT[$i]}" = - ]; then
-            log "        $st: $tot rows read for the period"
-        elif [ "$tot" != "${SRC_CNT[$i]}" ]; then
-            warn "$st: the API returned $tot rows but the earlier count said ${SRC_CNT[$i]} (the data changed in between). The $tot exported rows are used."
-        fi
-        SRC_CNT[$i]="$tot"
-        [ "$EXPORT_ONLY" = yes ] || set_expect "$i"
+        flight_take_total "$i"
     done
+}
+
+flight_take_total() { # i : read TOTAL from the helper output of table i, set SRC_CNT / EXPECT
+    local i="$1" st="${SRC_T[$1]}" tot
+    tot="$(grep -m1 '^TOTAL,' "$TMP/fl_$i.out" | cut -d, -f2 || true)"
+    [[ "$tot" =~ ^[0-9]+$ ]] || die "Flight SQL export of $st did not report a total"
+    if [ "${SRC_CNT[$i]}" = - ]; then
+        log "        $st: $tot rows read for the period"
+    elif [ "$tot" != "${SRC_CNT[$i]}" ]; then
+        warn "$st: the API returned $tot rows but the earlier count said ${SRC_CNT[$i]} (the data changed in between). The $tot exported rows are used."
+    fi
+    SRC_CNT[$i]="$tot"
+    [ "$EXPORT_ONLY" = yes ] || set_expect "$i"
 }
 
 declare -a SKIP
@@ -560,6 +614,7 @@ load_config() {
     : "${TIMEZONE:=UTC}"
     : "${FLIGHT_SLICE_MINUTES:=15}" "${FLIGHT_PAUSE_SECONDS:=2}" "${FLIGHT_MAX_ROWS:=100000}" "${FLIGHT_TIMEOUT_SECONDS:=120}"
     : "${FLIGHT_COUNT_MINUTES:=0}" "${FLIGHT_RETRIES:=3}" "${FLIGHT_RETRY_WAIT_SECONDS:=5}" "${FLIGHT_COUNT:=no}" "${FLIGHT_MAX_MESSAGE_MB:=1024}"
+    : "${FLIGHT_PARALLEL_TABLES:=4}" "${FLIGHT_SPLIT_ON_CAP:=yes}"
     : "${EXPORT_DIR:=}" "${EXPORT_KEEP:=yes}" "${EXPORT_OVERWRITE:=no}" "${PYTHON:=python3}"
     : "${OFFLINE:=yes}" "${DUCKDB:=duckdb}" "${DUCKDB_EXTENSION_DIR:=}" "${BUNDLE_DIR:=$HERE/bundle}" "${REPORT_DIR:=$HERE/reports}"
 }
@@ -590,6 +645,8 @@ validate_config() {
         [[ "$FLIGHT_PAUSE_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "FLIGHT_PAUSE_SECONDS must be a number of seconds (0 or more); got '$FLIGHT_PAUSE_SECONDS'"
         [[ "$FLIGHT_RETRY_WAIT_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "FLIGHT_RETRY_WAIT_SECONDS must be a number of seconds (0 or more); got '$FLIGHT_RETRY_WAIT_SECONDS'"
         [[ "$FLIGHT_MAX_MESSAGE_MB" =~ ^[0-9]+$ ]] && [ "$FLIGHT_MAX_MESSAGE_MB" -ge 16 ] || die "FLIGHT_MAX_MESSAGE_MB must be a whole number of 16 or more; got '$FLIGHT_MAX_MESSAGE_MB'"
+        [[ "$FLIGHT_PARALLEL_TABLES" =~ ^[1-9][0-9]*$ ]] || die "FLIGHT_PARALLEL_TABLES must be a whole number of 1 or more; got '$FLIGHT_PARALLEL_TABLES'"
+        case "$FLIGHT_SPLIT_ON_CAP" in yes|no) ;; *) die "FLIGHT_SPLIT_ON_CAP must be yes or no";; esac
         for n in FLIGHT_COUNT_MINUTES FLIGHT_RETRIES; do
             [[ "$(v "$n")" =~ ^[0-9]+$ ]] || die "$n must be a whole number (0 or more); got '$(v "$n")'"
         done
