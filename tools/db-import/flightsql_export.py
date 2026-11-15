@@ -172,9 +172,9 @@ def retry_waits(retries, first_wait):
 class Api:
     """One connection to the API that re-opens itself and retries transient failures."""
 
-    def __init__(self, host, port, timeout, retries=3, retry_wait=5.0):
+    def __init__(self, host, port, timeout, retries=3, retry_wait=5.0, max_msg_mb=1024):
         self.host, self.port, self.timeout = host, port, timeout
-        self.retries, self.retry_wait = retries, retry_wait
+        self.retries, self.retry_wait, self.max_msg_mb = retries, retry_wait, max_msg_mb
         self.con = None
         self.connect()
 
@@ -186,7 +186,10 @@ class Api:
             raise HelperError("adbc_driver_flightsql / pyarrow are not installed (%s). On a machine without internet use the bundle/pylibs folder." % e, 4)
         secs = str(int(self.timeout))
         opts = {"adbc.flight.sql.rpc.timeout_seconds.fetch": secs,
-                "adbc.flight.sql.rpc.timeout_seconds.query": secs}
+                "adbc.flight.sql.rpc.timeout_seconds.query": secs,
+                # the API sends a whole slice as one gRPC message; the driver's default limit is 16 MiB
+                # ("received message larger than max"), a 15-minute slice of a wide table is bigger
+                "adbc.flight.sql.client_option.with_max_msg_size": str(int(self.max_msg_mb) * 1024 * 1024)}
         try:
             self.con = fl.connect("grpc://%s:%s" % (self.host, self.port), db_kwargs=opts)
         except Exception as e:
@@ -361,6 +364,7 @@ def parse_args(argv):
     p.add_argument("--max-rows", type=int, default=100000)
     p.add_argument("--timeout-seconds", type=int, default=120)
     p.add_argument("--retries", type=int, default=3, help="retries of a query after a time limit or network error")
+    p.add_argument("--max-msg-mb", type=int, default=1024, help="largest gRPC message the client accepts, in MiB (driver default 16)")
     p.add_argument("--retry-wait", type=float, default=5, help="seconds before the first retry; doubled each time")
     p.add_argument("--out-dir", help="export only: parent folder; files go to <out-dir>/<table>/")
     p.add_argument("--overwrite", action="store_true")
@@ -384,7 +388,9 @@ def main(argv=None):
             raise HelperError("--max-rows and --slice-minutes must be 1 or more")
         if args.count_minutes < 0 or args.retries < 0 or args.retry_wait < 0:
             raise HelperError("--count-minutes, --retries and --retry-wait must be 0 or more")
-        con = Api(args.host, args.port, args.timeout_seconds, args.retries, args.retry_wait)
+        if args.max_msg_mb < 16:
+            raise HelperError("--max-msg-mb must be 16 or more")
+        con = Api(args.host, args.port, args.timeout_seconds, args.retries, args.retry_wait, args.max_msg_mb)
         try:
             col, kind, _ = probe(con, args)
             if args.command == "probe":

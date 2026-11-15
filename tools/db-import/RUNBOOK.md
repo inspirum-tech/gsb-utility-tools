@@ -191,6 +191,7 @@ The tool asks the API for the period in small time slices, saves them as parquet
 | `FLIGHT_SLICE_MINUTES` | length of one time slice (15 = exactly one quarter-hour timestamp per slice for the `QRLY` tables) | 15 |
 | `FLIGHT_COUNT` | `no`: the source rows are counted while they are read, `--check` and the plan show `-` for them (a count through the API costs as much as the read itself). `yes`: count first, in chunks | no |
 | `FLIGHT_COUNT_MINUTES` | with `FLIGHT_COUNT=yes`: the count is done in chunks of this many minutes and added up; one `count(*)` over days of a big table exceeds the API time limit. 0 = same as `FLIGHT_SLICE_MINUTES` | 0 |
+| `FLIGHT_MAX_MESSAGE_MB` | largest answer (one slice) the client accepts, in MiB. The driver's default is 16, which a 15-minute slice of a wide table exceeds (`received message larger than max`) | 1024 |
 | `FLIGHT_RETRIES` | how many times a query that hit the time limit or lost the connection (tunnel hiccup) is retried; the connection is re-opened first. Other errors are not retried | 3 |
 | `FLIGHT_RETRY_WAIT_SECONDS` | wait before the first retry, doubled each time (5, 10, 20 s) | 5 |
 | `FLIGHT_PAUSE_SECONDS` | wait between two slices, so the API (which prod users share) is not loaded | 2 |
@@ -461,6 +462,7 @@ Every message below is printed before anything is written, unless stated. Exit c
 | `row count check failed: expected N, found M` (table FAILED, rolled back) | the source changed during the run, or a trigger/rule changed the rows on the target. Nothing was changed for that table. Run again |
 | `FAILED: exit code ...; the transaction was rolled back` | read the error printed just above it (a constraint, a type mismatch, a lost connection). The target keeps its old rows for that table |
 | `DuckDB could not read the table columns` | the error just above says why: a wrong DuckLake schema or data path, a wrong password, or a file that does not exist |
+| `grpc: received message larger than max (N vs. M)` | one slice is bigger than `FLIGHT_MAX_MESSAGE_MB` (M bytes): raise it, or lower `FLIGHT_SLICE_MINUTES` |
 | `Python cannot load pyarrow / adbc_driver_flightsql` | `bundle/pylibs` is missing or incomplete: build it on a machine with internet with `./prepare-bundle.sh --with-flightsql` and copy `bundle/` (section 2) |
 | `bundle/pylibs was built for Python 'X' but this machine's python3 is 'Y'` | the packages only work with the Python they were built for: rebuild with the same Python version as this machine |
 | `cannot connect to the Flight SQL API at <host>:<port>` | the tunnel is not up, or the host or port is wrong, or the API's Flight SQL is off. Test: `bash -c '</dev/tcp/<host>/<port>' && echo open` |

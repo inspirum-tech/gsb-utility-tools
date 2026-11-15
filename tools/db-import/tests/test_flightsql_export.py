@@ -127,6 +127,24 @@ class T(unittest.TestCase):
         self.assertFalse(fx.is_transient("Catalog Error: Table with name KPI_X does not exist"))
         self.assertFalse(fx.is_transient("Parser Error: syntax error at or near"))
 
+    def test_max_message_size_is_passed_to_the_driver(self):
+        seen = {}
+
+        class FakeMod:
+            @staticmethod
+            def connect(uri, db_kwargs):
+                seen.update(db_kwargs); return object()
+
+        import types
+        sys.modules["adbc_driver_flightsql"] = types.ModuleType("adbc_driver_flightsql")
+        sys.modules["adbc_driver_flightsql.dbapi"] = FakeMod
+        try:
+            fx.Api("h", "1", 120, max_msg_mb=512)
+        finally:
+            del sys.modules["adbc_driver_flightsql.dbapi"], sys.modules["adbc_driver_flightsql"]
+        self.assertEqual(seen["adbc.flight.sql.client_option.with_max_msg_size"], str(512 * 1024 * 1024))
+        self.assertEqual(seen["adbc.flight.sql.rpc.timeout_seconds.fetch"], "120")
+
     def test_retry_waits_double(self):
         self.assertEqual(fx.retry_waits(3, 5), [5, 10, 20])
         self.assertEqual(fx.retry_waits(0, 5), [])

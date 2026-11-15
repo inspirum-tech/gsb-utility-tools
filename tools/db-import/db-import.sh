@@ -463,7 +463,7 @@ flight_probe_all() { # one structure read per table (plus a chunked count when F
             --time-column "$tc" --from-local "$FROM_TS" --to-local "$TO_TS" --timezone "$TIMEZONE" \
             --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS" \
             --slice-minutes "$FLIGHT_SLICE_MINUTES" --count-minutes "$FLIGHT_COUNT_MINUTES" \
-            --retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS")" \
+            --retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS" --max-msg-mb "$FLIGHT_MAX_MESSAGE_MB")" \
             || die "Flight SQL: cannot read $st (see the error above). Nothing was changed."
         SRC_COLS[$i]=""; FL_COL[$i]=""; FL_KIND[$i]=""; SRC_CNT[$i]=""
         while IFS= read -r line; do
@@ -499,7 +499,7 @@ flight_export_all() { # reads every table slice by slice into EXPORT_DIR/<TABLE>
                 --time-column "$tc" --from-local "$FROM_TS" --to-local "$TO_TS" --timezone "$TIMEZONE" \
                 --slice-minutes "$FLIGHT_SLICE_MINUTES" --pause-seconds "$FLIGHT_PAUSE_SECONDS" \
                 --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS" \
-                --retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS" \
+                --retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS" --max-msg-mb "$FLIGHT_MAX_MESSAGE_MB" \
                 --out-dir "$EXPORT_DIR" $ow | tee "$TMP/fl_$i.out" | sed -n 's/^SLICE,\([0-9]*\),\([0-9]*\),\([0-9]*\),kept$/        slice \1 of \2: \3 rows (kept from an earlier run)/p; s/^SLICE,\([0-9]*\),\([0-9]*\),\([0-9]*\),new$/        slice \1 of \2: \3 rows/p'; then
             die "reading $st from the API stopped (the reason is in the error above). Nothing was imported."
         fi
@@ -559,7 +559,7 @@ load_config() {
     : "${PERIOD_FROM:=}" "${PERIOD_TO:=}" "${TABLES:=}" "${ON_ERROR:=stop}"
     : "${TIMEZONE:=UTC}"
     : "${FLIGHT_SLICE_MINUTES:=15}" "${FLIGHT_PAUSE_SECONDS:=2}" "${FLIGHT_MAX_ROWS:=100000}" "${FLIGHT_TIMEOUT_SECONDS:=120}"
-    : "${FLIGHT_COUNT_MINUTES:=0}" "${FLIGHT_RETRIES:=3}" "${FLIGHT_RETRY_WAIT_SECONDS:=5}" "${FLIGHT_COUNT:=no}"
+    : "${FLIGHT_COUNT_MINUTES:=0}" "${FLIGHT_RETRIES:=3}" "${FLIGHT_RETRY_WAIT_SECONDS:=5}" "${FLIGHT_COUNT:=no}" "${FLIGHT_MAX_MESSAGE_MB:=1024}"
     : "${EXPORT_DIR:=}" "${EXPORT_KEEP:=yes}" "${EXPORT_OVERWRITE:=no}" "${PYTHON:=python3}"
     : "${OFFLINE:=yes}" "${DUCKDB:=duckdb}" "${DUCKDB_EXTENSION_DIR:=}" "${BUNDLE_DIR:=$HERE/bundle}" "${REPORT_DIR:=$HERE/reports}"
 }
@@ -589,6 +589,7 @@ validate_config() {
         done
         [[ "$FLIGHT_PAUSE_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "FLIGHT_PAUSE_SECONDS must be a number of seconds (0 or more); got '$FLIGHT_PAUSE_SECONDS'"
         [[ "$FLIGHT_RETRY_WAIT_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "FLIGHT_RETRY_WAIT_SECONDS must be a number of seconds (0 or more); got '$FLIGHT_RETRY_WAIT_SECONDS'"
+        [[ "$FLIGHT_MAX_MESSAGE_MB" =~ ^[0-9]+$ ]] && [ "$FLIGHT_MAX_MESSAGE_MB" -ge 16 ] || die "FLIGHT_MAX_MESSAGE_MB must be a whole number of 16 or more; got '$FLIGHT_MAX_MESSAGE_MB'"
         for n in FLIGHT_COUNT_MINUTES FLIGHT_RETRIES; do
             [[ "$(v "$n")" =~ ^[0-9]+$ ]] || die "$n must be a whole number (0 or more); got '$(v "$n")'"
         done
