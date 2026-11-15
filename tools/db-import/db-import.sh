@@ -530,7 +530,7 @@ load_config() {
     # shellcheck disable=SC1090
     source "$CONF"
     : "${JOB_NAME:=$(basename "$CONF" .env)}"
-    : "${SOURCE_TYPE:=}" "${TARGET_TYPE:=}" "${TARGET_ENV:=}"
+    : "${SOURCE_TYPE:=}" "${TARGET_TYPE:=}" "${TARGET_ENV:=}" "${SOURCE_PASSWORD_ENV:=}" "${TARGET_PASSWORD_ENV:=}"
     : "${SOURCE_PORT:=}" "${TARGET_PORT:=}"
     : "${SOURCE_DUCKLAKE_METADATA_SCHEMA:=metadata}" "${TARGET_DUCKLAKE_METADATA_SCHEMA:=metadata}"
     : "${SOURCE_SCHEMA:=}" "${TARGET_SCHEMA:=${SOURCE_SCHEMA}}"
@@ -545,7 +545,7 @@ load_config() {
 }
 
 validate_config() {
-    if [ "$SOURCE_TYPE" = flightsql ] && [ -n "$SOURCE_PASSWORD_ENV" ]; then
+    if [ "$SOURCE_TYPE" = flightsql ] && [ -n "${SOURCE_PASSWORD_ENV:-}" ]; then
         warn "SOURCE_PASSWORD_ENV is ignored for a flightsql source (the API has no login)"; SOURCE_PASSWORD_ENV=""
     fi
     validate_side SOURCE
