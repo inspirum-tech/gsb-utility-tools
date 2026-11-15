@@ -324,6 +324,9 @@ BEGIN;
         sql+="CREATE SCHEMA IF NOT EXISTS tgt.\"$TARGET_SCHEMA\";
 CREATE TABLE $T AS SELECT * FROM $S WHERE 1 = 0;
 "
+        local pb; pb="$(partition_clause "$i")"
+        [ -z "$pb" ] || sql+="ALTER TABLE $T SET PARTITIONED BY ($pb);
+"
     fi
     if [ -n "${BK_NAME[$i]}" ]; then
         sql+="CREATE SCHEMA IF NOT EXISTS tgt.\"$BACKUP_SCHEMA\";
@@ -551,6 +554,7 @@ load_config() {
     : "${SOURCE_DUCKLAKE_METADATA_SCHEMA:=metadata}" "${TARGET_DUCKLAKE_METADATA_SCHEMA:=metadata}"
     : "${SOURCE_SCHEMA:=}" "${TARGET_SCHEMA:=${SOURCE_SCHEMA}}"
     : "${LOAD_MODE:=replace}" "${BACKUP:=on}" "${BACKUP_SCHEMA:=import_backup}" "${CREATE_MISSING:=yes}"
+    : "${TARGET_PARTITION_BY=year({TIME}), month({TIME}), day({TIME})}"
     : "${TIME_COLUMN:=PERIOD_START_TIME}" "${TABLE_TIME_COLUMNS:=}" "${FULL_COPY_TABLES:=}"
     : "${PERIOD_FROM:=}" "${PERIOD_TO:=}" "${TABLES:=}" "${ON_ERROR:=stop}"
     : "${TIMEZONE:=UTC}"
@@ -574,6 +578,7 @@ validate_config() {
     case "$LOAD_MODE" in replace|append|stop) ;; *) die "LOAD_MODE must be replace, append or stop";; esac
     case "$BACKUP" in on|off) ;; *) die "BACKUP must be on or off";; esac
     case "$CREATE_MISSING" in yes|no) ;; *) die "CREATE_MISSING must be yes or no";; esac
+    [ -z "$TARGET_PARTITION_BY" ] || check_re TARGET_PARTITION_BY "$TARGET_PARTITION_BY" '^[A-Za-z0-9_(){}, ]+$'
     case "$ON_ERROR" in stop|continue) ;; *) die "ON_ERROR must be stop or continue";; esac
     case "$OFFLINE" in yes|no) ;; *) die "OFFLINE must be yes or no";; esac
     [ -z "$DUCKDB_EXTENSION_DIR" ] || check_re DUCKDB_EXTENSION_DIR "$DUCKDB_EXTENSION_DIR" "$re_path"
@@ -667,6 +672,12 @@ SELECT 'TEXISTS,' || table_name FROM information_schema.tables WHERE table_catal
             else [ -n "${TGT_COLS[$i]}" ] || die "target table ${TGT_T[$i]} has no columns"; fi
         done
     fi
+}
+
+partition_clause() { # i -> the DuckLake partition expressions for a created table (empty = none): TARGET_PARTITION_BY with {TIME} = its time column
+    local i="$1"
+    [ "$TARGET_TYPE" = ducklake ] && [ -n "${TARGET_PARTITION_BY:-}" ] && [ "${MODE[$i]:-}" = window ] || return 0
+    printf '%s' "${TARGET_PARTITION_BY//\{TIME\}/\"${TC[$i]}\"}"
 }
 
 mark_create() { # i : the target table is missing -> create it like the source (or refuse)
@@ -771,7 +782,7 @@ print_plan() {
     done
     echo
     local n=0; for i in "${!SRC_T[@]}"; do [ "${CREATE[$i]:-}" != yes ] || n=$((n+1)); done
-    [ "$n" -eq 0 ] || echo "(NEW): $n target table(s) do not exist and will be created in schema \"$TARGET_SCHEMA\" (schema too, if missing) with the source's columns and types, each in the same transaction as its import."
+    [ "$n" -eq 0 ] || echo "(NEW): $n target table(s) do not exist and will be created in schema \"$TARGET_SCHEMA\" (schema too, if missing) with the source's columns and types, each in the same transaction as its import.$([ "$TARGET_TYPE" = ducklake ] && [ -n "$TARGET_PARTITION_BY" ] && echo " DuckLake partitioning: $TARGET_PARTITION_BY ({TIME} = the time column); tables copied whole are not partitioned.")"
     case "$LOAD_MODE" in
         replace) echo "LOAD_MODE=replace: target rows in the period are deleted, then the source rows are inserted." ;;
         append)  echo "LOAD_MODE=append: source rows are inserted, nothing is deleted (running twice gives duplicates)." ;;

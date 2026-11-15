@@ -155,6 +155,7 @@ The target table must already exist. The tool never creates tables.
 | | `stop` | refuse if the target already has rows for the period |
 | `BACKUP` | `on` (default) / `off` | on: the replaced rows are first saved in the **target database** as `<BACKUP_SCHEMA>."<table>_bak_<date_time>"`. off: no backup, a warning is printed |
 | `BACKUP_SCHEMA` | default `import_backup` | the schema for the backup tables |
+| `TARGET_PARTITION_BY` | default `year({TIME}), month({TIME}), day({TIME})` | DuckLake target only: the partitioning given to a table the tool creates (`{TIME}` = the table's time column), as the gsb pivot tables have. Empty = no partitioning. Tables copied whole and Postgres targets: not applied |
 | `CREATE_MISSING` | `yes` (default) / `no` | yes: a target schema or table that does not exist is created like the source (same columns and types) in the same transaction as the import; the plan shows `(NEW)` and the log `created target table ...`. no: a missing target table stops the run before anything is written |
 | `ON_ERROR` | `stop` (default) / `continue` | stop at the first failed table, or go on with the next one (the failed table is rolled back either way) |
 | `FULL_COPY_TABLES` | table names | for a table with **no time column** that must be replaced whole. A table without the time column that is not listed stops the run |
