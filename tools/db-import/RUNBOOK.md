@@ -187,22 +187,29 @@ The tool asks the API for the period in small time slices, saves them as parquet
 | `TABLES`, `PERIOD_FROM`, `PERIOD_TO`, `TIMEZONE` | as for every job (`TIMEZONE="Australia/Sydney"`) | |
 | `FLIGHT_MAX_ROWS` | the API's row cap (`FLIGHTSQL__MAX_ROWS` on the API: ask its owner). A slice that returns this many rows **or more** fails the table, because the API cuts a bigger result silently | 100000 |
 | `FLIGHT_SLICE_MINUTES` | length of one time slice (15 = exactly one quarter-hour timestamp per slice for the `QRLY` tables) | 15 |
-| `FLIGHT_COUNT_MINUTES` | `--check` counts the rows in chunks of this many minutes and adds them up; one `count(*)` over days of a big table exceeds the API time limit. 0 = same as `FLIGHT_SLICE_MINUTES` | 0 |
+| `FLIGHT_COUNT` | `no`: the source rows are counted while they are read, `--check` and the plan show `-` for them (a count through the API costs as much as the read itself). `yes`: count first, in chunks | no |
+| `FLIGHT_COUNT_MINUTES` | with `FLIGHT_COUNT=yes`: the count is done in chunks of this many minutes and added up; one `count(*)` over days of a big table exceeds the API time limit. 0 = same as `FLIGHT_SLICE_MINUTES` | 0 |
 | `FLIGHT_RETRIES` | how many times a query that hit the time limit or lost the connection (tunnel hiccup) is retried; the connection is re-opened first. Other errors are not retried | 3 |
 | `FLIGHT_RETRY_WAIT_SECONDS` | wait before the first retry, doubled each time (5, 10, 20 s) | 5 |
 | `FLIGHT_PAUSE_SECONDS` | wait between two slices, so the API (which prod users share) is not loaded | 2 |
 | `FLIGHT_TIMEOUT_SECONDS` | time limit of one query | 120 |
-| `EXPORT_DIR` | where the parquet files go, as `<EXPORT_DIR>/<TABLE>/*.parquet` | `reports/<run>/export` |
-| `EXPORT_KEEP` | `yes` keeps the files after the run, so the same data can be imported again without asking the API; `no` removes them at the end | `yes` |
-| `EXPORT_OVERWRITE` | `yes` replaces an earlier export of the same table in `EXPORT_DIR`; `no` refuses (an old copy is never mixed with a new one) | `no` |
+| `EXPORT_DIR` | where the parquet files go, as `<EXPORT_DIR>/<TABLE>/*.parquet`. Fixed per job and period, so a second run of the same job finds the files of the first | `export/<JOB_NAME>_<from>_<to>` next to the script |
+| `EXPORT_KEEP` | `yes` keeps the files after the run (needed to resume, and to import again without asking the API); `no` removes them at the end of a successful run | `yes` |
+| `EXPORT_OVERWRITE` | `no`: resume (see below). `yes`: read every slice again and import every table again, whatever is in `EXPORT_DIR` | `no` |
 | `PYTHON` | the Python program | `python3` |
 
 There is no `SOURCE_PASSWORD_ENV` for this source (the API has no login). The time column is found by name, upper or lower case (`TIME_COLUMN`, default `PERIOD_START_TIME`; `TABLE_TIME_COLUMNS` for another name).
 
 **What a run does**
-1. `--check`: for each table the API is asked for its structure and one row count for the period. Nothing is exported and nothing is written.
+1. `--check`: for each table the API is asked for its structure (and, with `FLIGHT_COUNT="yes"`, a row count for the period). Nothing is exported and nothing is written.
 2. The plan is printed (and, for a prod target, you confirm). Only then the export starts: one slice at a time, with a pause, into `EXPORT_DIR`.
 3. The exported files are imported like a parquet source. The row-count check uses the number of rows that were really exported.
+
+**A run that stopped is simply started again** (error, Ctrl-C, tunnel or API down). Nothing has to be cleaned up:
+- every slice is written as its own file, complete or absent; slice files already in `EXPORT_DIR/<TABLE>/` are kept (`slice n of m: x rows (kept from an earlier run)`) and only the missing ones are read from the API;
+- a table that was already imported into the same target for this period (file `_IMPORTED` in its export folder, written after a successful real run) is skipped with `SKIPPED: already imported on ...`;
+- the import of a table is one transaction, so a table that failed left nothing behind and is simply done again.
+To import a table again on purpose, remove its `_IMPORTED` file (or set `EXPORT_OVERWRITE="yes"`, which also reads it again). A folder that holds an export of **another** period or slice length is refused, so two windows are never mixed. `--dry-run` reads (and keeps) the files but writes no marker.
 
 **Run it in two steps, or later again**
 - Only fetch the data, touching no database (the `TARGET_*` settings are not used and no target password is needed): `./db-import.sh --export-only configs/<job>.env`. The files are kept.

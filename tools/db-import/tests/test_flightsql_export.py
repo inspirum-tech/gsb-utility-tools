@@ -169,6 +169,30 @@ class T(unittest.TestCase):
         for (a, b), (c, d) in zip(chunks, chunks[1:]):
             self.assertEqual(b, c)
 
+    def test_existing_export_resume_rules(self):
+        import tempfile, json, shutil
+        d = tempfile.mkdtemp(); out = os.path.join(d, "T")
+        plan = {"schema": "s", "table": "T", "time_column": "PERIOD_START_TIME", "kind": "aware",
+                "from_local": "2026-11-01 00:00:00", "to_local": "2026-11-03 00:00:00", "timezone": "Australia/Sydney", "slice_minutes": 15}
+        try:
+            self.assertEqual(fx.existing_export(out, plan, False), "empty")           # no folder
+            os.makedirs(out); open(os.path.join(out, "x.tmp"), "w").close()
+            self.assertEqual(fx.existing_export(out, plan, False), "empty")           # only a half-written file
+            open(os.path.join(out, "00001_a.parquet"), "w").close()
+            with self.assertRaises(fx.HelperError) as cm:
+                fx.existing_export(out, plan, False)                                   # files but no plan
+            self.assertEqual(cm.exception.code, 5)
+            json.dump(plan, open(os.path.join(out, fx.PLAN_FILE), "w"))
+            self.assertEqual(fx.existing_export(out, plan, False), "resume")          # same plan
+            other = dict(plan, to_local="2026-11-04 00:00:00")
+            with self.assertRaises(fx.HelperError) as cm:
+                fx.existing_export(out, other, False)                                  # another window
+            self.assertIn("to_local", str(cm.exception))
+            self.assertEqual(fx.existing_export(out, other, True), "empty")           # overwrite wipes
+            self.assertEqual(os.listdir(out), [])
+        finally:
+            shutil.rmtree(d)
+
     def test_slice_file_names_sort_in_order(self):
         names = [fx.slice_file_name(i, "aware", dt.datetime(2026, 1, 1, tzinfo=UTC)) for i in (1, 2, 10, 100)]
         self.assertEqual(names, sorted(names))

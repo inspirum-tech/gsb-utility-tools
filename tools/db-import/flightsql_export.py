@@ -11,9 +11,13 @@ Standalone: only the Python standard library plus `pyarrow` and `adbc-driver-fli
 bundle/pylibs on a machine without internet). Python 3.9 or newer.
 
 Commands (all read-only towards the API):
-  probe   read the table structure (SELECT ... LIMIT 0) and count the rows of the window, in chunks
-          of --count-minutes (one count(*) over days of data times out on the big tables)
-  export  probe, then read the window slice by slice and write the parquet files
+  probe   read the table structure (SELECT ... LIMIT 0); with --count also count the rows of the
+          window, in chunks of --count-minutes (one count(*) over days of data times out on the
+          big tables; a count costs about as much as the read itself, so it is off by default)
+  export  probe, then read the window slice by slice and write the parquet files. RESUMES: a slice
+          whose file is already in the folder (same table, window, time zone and slice length,
+          recorded in _PLAN.json) is kept and not asked again; only the missing slices are read.
+          A folder made for another window / slice length is refused (use --overwrite or another folder).
 
 Every query is retried (--retries, waiting --retry-wait seconds, doubled each time) when the API
 times out or the connection drops; the connection is re-opened before the retry. Other errors
@@ -256,21 +260,66 @@ def window_count(con, args, col, kind):
     return n
 
 
+PLAN_FILE, DONE_FILE = "_PLAN.json", "_DONE"
+
+
+def export_plan(args, col, kind):
+    """What the files in the folder stand for. Two exports may share a folder only if this is equal."""
+    return {"schema": args.schema, "table": args.table, "time_column": col, "kind": kind,
+            "from_local": args.from_local, "to_local": args.to_local, "timezone": args.timezone,
+            "slice_minutes": args.slice_minutes}
+
+
+def existing_export(out_dir, plan, overwrite):
+    """Decide what to do with a folder that already holds files.
+    -> 'empty' (nothing there), 'resume' (same plan: keep the slice files), or raises.
+    overwrite=True wipes the folder and returns 'empty'."""
+    if not os.path.isdir(out_dir):
+        return "empty"
+    files = os.listdir(out_dir)
+    has_data = any(f.endswith(".parquet") or f == DONE_FILE for f in files)
+    if overwrite:
+        for f in files:
+            if f.endswith(".parquet") or f.endswith(".tmp") or f in (DONE_FILE, PLAN_FILE):
+                os.remove(os.path.join(out_dir, f))
+        return "empty"
+    if not has_data:
+        return "empty"
+    plan_path = os.path.join(out_dir, PLAN_FILE)
+    if not os.path.isfile(plan_path):
+        raise HelperError("%s already holds parquet files but no %s (an export made by an older version, or not by this tool). "
+                          "Use another EXPORT_DIR, or set EXPORT_OVERWRITE=\"yes\" to replace them (helper option: --overwrite)" % (out_dir, PLAN_FILE), 5)
+    with open(plan_path) as fh:
+        old = json.load(fh)
+    if old != plan:
+        diff = ", ".join("%s: %s -> %s" % (k, old.get(k), plan.get(k)) for k in sorted(set(old) | set(plan)) if old.get(k) != plan.get(k))
+        raise HelperError("%s holds an export of another window or slice length (%s). Use another EXPORT_DIR, or set "
+                          "EXPORT_OVERWRITE=\"yes\" to replace it (helper option: --overwrite)" % (out_dir, diff), 5)
+    return "resume"
+
+
 def export(con, args, col, kind):
     import pyarrow.parquet as pq
     ref = table_ref(args.schema, args.table)
     out_dir = os.path.join(args.out_dir, args.table)
-    if os.path.isdir(out_dir) and any(f.endswith(".parquet") or f == "_DONE" for f in os.listdir(out_dir)):
-        if not args.overwrite:
-            raise HelperError("%s already holds files from an earlier export. Use another EXPORT_DIR, or set EXPORT_OVERWRITE=\"yes\" in the config (helper option: --overwrite)" % out_dir, 5)
-        for f in os.listdir(out_dir):
-            if f.endswith(".parquet") or f.endswith(".tmp") or f == "_DONE":
-                os.remove(os.path.join(out_dir, f))
+    plan = export_plan(args, col, kind)
+    state = existing_export(out_dir, plan, args.overwrite)
     os.makedirs(out_dir, exist_ok=True)
+    for f in os.listdir(out_dir):                       # a half-written slice from a run that was killed
+        if f.endswith(".tmp"):
+            os.remove(os.path.join(out_dir, f))
+    with open(os.path.join(out_dir, PLAN_FILE), "w") as fh:
+        json.dump(plan, fh)
 
     slices = make_slices(parse_local(args.from_local), parse_local(args.to_local), args.slice_minutes, args.timezone, kind)
-    total = 0
+    total, kept, fetched = 0, 0, 0
     for i, (lo, hi) in enumerate(slices, 1):
+        final = os.path.join(out_dir, slice_file_name(i, kind, lo))
+        if state == "resume" and os.path.isfile(final):
+            n = pq.read_metadata(final).num_rows
+            total += n; kept += 1
+            print("SLICE,%d,%d,%d,kept" % (i, len(slices), n), flush=True)
+            continue
         table = con.run("SELECT * FROM %s WHERE %s" % (ref, where_clause(kind, col, lo, hi)))
         n = table.num_rows
         if n >= args.max_rows:
@@ -278,19 +327,18 @@ def export(con, args, col, kind):
                 "slice %d of %d (%s) returned %d rows, which is the row cap (%d): the API may have cut the result. "
                 "Nothing was imported. Lower FLIGHT_SLICE_MINUTES (now %d) and run again."
                 % (i, len(slices), lo.strftime(FMT), n, args.max_rows, args.slice_minutes), 3)
-        final = os.path.join(out_dir, slice_file_name(i, kind, lo))
         tmp = final + ".tmp"
         pq.write_table(table, tmp)
         os.replace(tmp, final)             # a slice file is either complete or absent
-        total += n
-        print("SLICE,%d,%d,%d" % (i, len(slices), n), flush=True)
+        total += n; fetched += 1
+        print("SLICE,%d,%d,%d,new" % (i, len(slices), n), flush=True)
         if i < len(slices) and args.pause_seconds > 0:
             time.sleep(args.pause_seconds)
-    with open(os.path.join(out_dir, "_DONE"), "w") as fh:
-        json.dump({"table": args.table, "schema": args.schema, "time_column": col, "kind": kind,
-                   "from_local": args.from_local, "to_local": args.to_local, "timezone": args.timezone,
-                   "slices": len(slices), "rows": total,
-                   "finished_utc": dt.datetime.now(UTC).strftime(FMT)}, fh)
+    if kept:
+        err("  %s: %d slice(s) were already on disk from an earlier run and were kept, %d read from the API" % (args.table, kept, fetched))
+    with open(os.path.join(out_dir, DONE_FILE), "w") as fh:
+        json.dump(dict(plan, slices=len(slices), rows=total, kept=kept, fetched=fetched,
+                       finished_utc=dt.datetime.now(UTC).strftime(FMT)), fh)
     print("TOTAL,%d" % total, flush=True)
     return total
 
@@ -316,7 +364,8 @@ def parse_args(argv):
     p.add_argument("--retry-wait", type=float, default=5, help="seconds before the first retry; doubled each time")
     p.add_argument("--out-dir", help="export only: parent folder; files go to <out-dir>/<table>/")
     p.add_argument("--overwrite", action="store_true")
-    p.add_argument("--no-count", action="store_true", help="probe only: skip the count(*) query")
+    p.add_argument("--count", action="store_true", help="probe only: also count the rows of the window (chunked)")
+    p.add_argument("--no-count", action="store_true", help="(kept for old callers: counting is off by default)")
     p.add_argument("--pylibs", help="folder with pyarrow and adbc-driver-flightsql (bundle/pylibs on an offline server)")
     return p.parse_args(argv)
 
@@ -339,7 +388,7 @@ def main(argv=None):
         try:
             col, kind, _ = probe(con, args)
             if args.command == "probe":
-                if not args.no_count:
+                if args.count and not args.no_count:
                     window_count(con, args, col, kind)
             else:
                 export(con, args, col, kind)

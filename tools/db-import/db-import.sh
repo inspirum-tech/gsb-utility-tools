@@ -430,12 +430,17 @@ setup_flight() {
     fi
 }
 
-flight_probe_all() { # one structure read and one count(*) per table; fills SRC_COLS, SRC_CNT, FL_COL, FL_KIND
-    local i st tc out line
-    log "Flight SQL source $SOURCE_HOST:$SOURCE_PORT, schema $SOURCE_SCHEMA (structure and row count per table; count in chunks of ${FLIGHT_COUNT_MINUTES:-$FLIGHT_SLICE_MINUTES} min, $FLIGHT_RETRIES retries)"
+flight_probe_all() { # one structure read per table (plus a chunked count when FLIGHT_COUNT=yes); fills SRC_COLS, SRC_CNT, FL_COL, FL_KIND
+    local i st tc out line cnt=""
+    if [ "$FLIGHT_COUNT" = yes ]; then
+        cnt="--count"
+        log "Flight SQL source $SOURCE_HOST:$SOURCE_PORT, schema $SOURCE_SCHEMA (structure and row count per table; count in chunks of $([ "$FLIGHT_COUNT_MINUTES" = 0 ] && echo "$FLIGHT_SLICE_MINUTES" || echo "$FLIGHT_COUNT_MINUTES") min, $FLIGHT_RETRIES retries)"
+    else
+        log "Flight SQL source $SOURCE_HOST:$SOURCE_PORT, schema $SOURCE_SCHEMA (structure per table; FLIGHT_COUNT=no: the source rows are counted while they are read)"
+    fi
     for i in "${!SRC_T[@]}"; do
         st="${SRC_T[$i]}"; tc="$(tcol_for "$st")"
-        out="$(flight_py probe --host "$SOURCE_HOST" --port "$SOURCE_PORT" --schema "$SOURCE_SCHEMA" --table "$st" \
+        out="$(flight_py probe $cnt --host "$SOURCE_HOST" --port "$SOURCE_PORT" --schema "$SOURCE_SCHEMA" --table "$st" \
             --time-column "$tc" --from-local "$FROM_TS" --to-local "$TO_TS" --timezone "$TIMEZONE" \
             --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS" \
             --slice-minutes "$FLIGHT_SLICE_MINUTES" --count-minutes "$FLIGHT_COUNT_MINUTES" \
@@ -450,9 +455,13 @@ flight_probe_all() { # one structure read and one count(*) per table; fills SRC_
                 SCOL,*)   SRC_COLS[$i]+="${line#SCOL,}"$'\n' ;;
             esac
         done <<<"$out"
-        [[ "${SRC_CNT[$i]}" =~ ^[0-9]+$ ]] || die "Flight SQL: no row count came back for $st"
+        if [ "$FLIGHT_COUNT" = yes ]; then
+            [[ "${SRC_CNT[$i]}" =~ ^[0-9]+$ ]] || die "Flight SQL: no row count came back for $st"
+        else
+            SRC_CNT[$i]="-"              # filled in by flight_export_all with the rows really read
+        fi
         [ -n "${SRC_COLS[$i]}" ] || die "Flight SQL: no columns came back for $st"
-        log "    $st: time column ${FL_COL[$i]} (${FL_KIND[$i]}), $(printf '%s' "${SRC_COLS[$i]}" | grep -c .) columns, ${SRC_CNT[$i]} rows in the period"
+        log "    $st: time column ${FL_COL[$i]} (${FL_KIND[$i]}), $(printf '%s' "${SRC_COLS[$i]}" | grep -c .) columns$([ "${SRC_CNT[$i]}" = - ] || echo ", ${SRC_CNT[$i]} rows in the period")"
     done
 }
 
@@ -461,8 +470,10 @@ flight_export_all() { # reads every table slice by slice into EXPORT_DIR/<TABLE>
     [ "$EXPORT_OVERWRITE" = yes ] && ow="--overwrite"
     mkdir -p "$EXPORT_DIR"
     log "exporting from the API: slices of $FLIGHT_SLICE_MINUTES min, pause $FLIGHT_PAUSE_SECONDS s, row cap $FLIGHT_MAX_ROWS, into $EXPORT_DIR"
+    [ "$EXPORT_OVERWRITE" = yes ] || log "    (slice files already in $EXPORT_DIR from an earlier run of the same period are kept: only the missing slices are read)"
     for i in "${!SRC_T[@]}"; do
         st="${SRC_T[$i]}"; tc="$(tcol_for "$st")"
+        if [ -n "${SKIP[$i]:-}" ]; then log "    [$((i+1))/${#SRC_T[@]}] $st: ${SKIP[$i]}"; continue; fi
         FL_EXPORTED+=" $st"
         log "    [$((i+1))/${#SRC_T[@]}] $st"
         if ! flight_py export --host "$SOURCE_HOST" --port "$SOURCE_PORT" --schema "$SOURCE_SCHEMA" --table "$st" \
@@ -470,17 +481,39 @@ flight_export_all() { # reads every table slice by slice into EXPORT_DIR/<TABLE>
                 --slice-minutes "$FLIGHT_SLICE_MINUTES" --pause-seconds "$FLIGHT_PAUSE_SECONDS" \
                 --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS" \
                 --retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS" \
-                --out-dir "$EXPORT_DIR" $ow | tee "$TMP/fl_$i.out" | sed -n 's/^SLICE,/        slice /p'; then
+                --out-dir "$EXPORT_DIR" $ow | tee "$TMP/fl_$i.out" | sed -n 's/^SLICE,\([0-9]*\),\([0-9]*\),\([0-9]*\),kept$/        slice \1 of \2: \3 rows (kept from an earlier run)/p; s/^SLICE,\([0-9]*\),\([0-9]*\),\([0-9]*\),new$/        slice \1 of \2: \3 rows/p'; then
             die "reading $st from the API stopped (the reason is in the error above). Nothing was imported."
         fi
         tot="$(grep -m1 '^TOTAL,' "$TMP/fl_$i.out" | cut -d, -f2 || true)"
         [[ "$tot" =~ ^[0-9]+$ ]] || die "Flight SQL export of $st did not report a total"
-        if [ "$tot" != "${SRC_CNT[$i]}" ]; then
+        if [ "${SRC_CNT[$i]}" = - ]; then
+            log "        $st: $tot rows read for the period"
+        elif [ "$tot" != "${SRC_CNT[$i]}" ]; then
             warn "$st: the API returned $tot rows but the earlier count said ${SRC_CNT[$i]} (the data changed in between). The $tot exported rows are used."
-            SRC_CNT[$i]="$tot"
-            [ "$EXPORT_ONLY" = yes ] || set_expect "$i"
+        fi
+        SRC_CNT[$i]="$tot"
+        [ "$EXPORT_ONLY" = yes ] || set_expect "$i"
+    done
+}
+
+declare -a SKIP
+flight_mark_done() { # a table imported into this target in an earlier real run of the same period is skipped (marker _IMPORTED in its export folder)
+    local i f
+    [ "$DRY_RUN" = no ] && [ "$EXPORT_OVERWRITE" = no ] || return 0
+    for i in "${!SRC_T[@]}"; do
+        f="$EXPORT_DIR/${SRC_T[$i]}/_IMPORTED"
+        [ -f "$f" ] || continue
+        if grep -qxF "target=$(side_fingerprint TARGET)/$TARGET_SCHEMA.${TGT_T[$i]}" "$f"; then
+            SKIP[$i]="already imported on $(sed -n 's/^when=//p' "$f") (${LOAD_MODE}); to import it again remove $f or set EXPORT_OVERWRITE=\"yes\""
         fi
     done
+}
+
+flight_write_marker() { # i : after a successful real import
+    local f="$EXPORT_DIR/${SRC_T[$1]}/_IMPORTED"
+    [ -d "$EXPORT_DIR/${SRC_T[$1]}" ] || return 0
+    printf 'target=%s/%s.%s\nwhen=%s\nrows=%s\nmode=%s\n' "$(side_fingerprint TARGET)" "$TARGET_SCHEMA" "${TGT_T[$1]}" \
+        "$(date '+%Y-%m-%d %H:%M:%S')" "${SRC_CNT[$1]}" "$LOAD_MODE" >"$f"
 }
 
 flight_cleanup() { # EXPORT_KEEP=no: remove the table folders this run wrote
@@ -506,7 +539,7 @@ load_config() {
     : "${PERIOD_FROM:=}" "${PERIOD_TO:=}" "${TABLES:=}" "${ON_ERROR:=stop}"
     : "${TIMEZONE:=UTC}"
     : "${FLIGHT_SLICE_MINUTES:=15}" "${FLIGHT_PAUSE_SECONDS:=2}" "${FLIGHT_MAX_ROWS:=100000}" "${FLIGHT_TIMEOUT_SECONDS:=120}"
-    : "${FLIGHT_COUNT_MINUTES:=0}" "${FLIGHT_RETRIES:=3}" "${FLIGHT_RETRY_WAIT_SECONDS:=5}"
+    : "${FLIGHT_COUNT_MINUTES:=0}" "${FLIGHT_RETRIES:=3}" "${FLIGHT_RETRY_WAIT_SECONDS:=5}" "${FLIGHT_COUNT:=no}"
     : "${EXPORT_DIR:=}" "${EXPORT_KEEP:=yes}" "${EXPORT_OVERWRITE:=no}" "${PYTHON:=python3}"
     : "${OFFLINE:=yes}" "${DUCKDB:=duckdb}" "${DUCKDB_EXTENSION_DIR:=}" "${BUNDLE_DIR:=$HERE/bundle}" "${REPORT_DIR:=$HERE/reports}"
 }
@@ -538,6 +571,7 @@ validate_config() {
             [[ "$(v "$n")" =~ ^[0-9]+$ ]] || die "$n must be a whole number (0 or more); got '$(v "$n")'"
         done
         case "$EXPORT_KEEP" in yes|no) ;; *) die "EXPORT_KEEP must be yes or no";; esac
+        case "$FLIGHT_COUNT" in yes|no) ;; *) die "FLIGHT_COUNT must be yes or no";; esac
         case "$EXPORT_OVERWRITE" in yes|no) ;; *) die "EXPORT_OVERWRITE must be yes or no";; esac
         check_re PYTHON "$PYTHON" "$re_path"
         [ -z "$EXPORT_DIR" ] || check_re EXPORT_DIR "$EXPORT_DIR" "$re_path"
@@ -652,7 +686,7 @@ preflight_counts() {
         local sql tag idx s t; sql="$(duck_head)"$'\n'
         for i in "${!SRC_T[@]}"; do
             local scnt
-            if [ "$SOURCE_TYPE" = flightsql ]; then scnt="${SRC_CNT[$i]}"      # counted through the API by flight_probe_all
+            if [ "$SOURCE_TYPE" = flightsql ]; then scnt="'${SRC_CNT[$i]}'"    # counted through the API by flight_probe_all, or '-' (counted during the export)
             else scnt="(SELECT count(*) FROM $(tbl_expr SOURCE "${SRC_T[$i]}") ${WHERE[$i]})"; fi
             sql+="SELECT 'CNT,$i,' || $scnt || ',' || (SELECT count(*) FROM $(tbl_expr TARGET "${TGT_T[$i]}") ${WHERE[$i]});
 "
@@ -665,8 +699,10 @@ preflight_counts() {
     fi
     local stamp; stamp="$RUN_TS"
     for i in "${!SRC_T[@]}"; do
-        [[ "${SRC_CNT[$i]:-}" =~ ^[0-9]+$ && "${TGT_CNT[$i]:-}" =~ ^[0-9]+$ ]] || die "could not read the row counts for ${SRC_T[$i]}"
-        set_expect "$i"
+        [[ "${TGT_CNT[$i]:-}" =~ ^[0-9]+$ ]] || die "could not read the target row count for ${TGT_T[$i]}"
+        if [[ "${SRC_CNT[$i]:-}" =~ ^[0-9]+$ ]]; then set_expect "$i"
+        elif [ "${SRC_CNT[$i]:-}" = - ] && [ "$SOURCE_TYPE" = flightsql ]; then EXPECT[$i]=""   # set after the export
+        else die "could not read the source row count for ${SRC_T[$i]}"; fi
         BK_NAME[$i]=""
         if [ "$BACKUP" = on ] && [ "$LOAD_MODE" = replace ] && [ "${TGT_CNT[$i]}" -gt 0 ]; then
             local suffix="_bak_$stamp" base="${TGT_T[$i]}"
@@ -766,7 +802,8 @@ main() {
     trap 'flight_cleanup; rm -rf "$TMP"' EXIT
     cp "$CONF" "$RUN_DIR/config_used.env"
     if [ "$SOURCE_TYPE" = flightsql ]; then
-        [ -n "$EXPORT_DIR" ] || EXPORT_DIR="$RUN_DIR/export"
+        # fixed per job and period (not per run), so that a run that stopped can be started again and go on where it was
+        [ -n "$EXPORT_DIR" ] || EXPORT_DIR="$HERE/export/${JOB_NAME}_${FROM_TS//[^0-9]/}_${TO_TS//[^0-9]/}"
         check_re EXPORT_DIR "$EXPORT_DIR" "$re_path"
         if [ "$EXPORT_ONLY" = yes ] && [ "$EXPORT_KEEP" = no ]; then
             warn "EXPORT_KEEP=no is ignored with --export-only: the files are the result and are kept in $EXPORT_DIR"
@@ -805,14 +842,20 @@ main() {
     decide_tables
     preflight_counts
     print_plan
+    [ "$SOURCE_TYPE" != flightsql ] || [ "$FLIGHT_COUNT" = yes ] || echo "SOURCE ROWS '-': with FLIGHT_COUNT=no the Flight SQL rows are counted while they are read (a count through the API costs as much as the read). FLIGHT_COUNT=\"yes\" counts them in --check."
     [ "$CHECK_ONLY" = no ] || { log "check only: nothing was changed"; exit 0; }
     confirm_target
-    if [ "$SOURCE_TYPE" = flightsql ]; then flight_export_all; fi
+    if [ "$SOURCE_TYPE" = flightsql ]; then flight_mark_done; flight_export_all; fi
 
     local i failed=0
     for i in "${!SRC_T[@]}"; do
         log "[$((i+1))/${#SRC_T[@]}] ${SRC_T[$i]} -> ${TGT_T[$i]}"
+        if [ -n "${SKIP[$i]:-}" ]; then
+            STATUS[$i]="SKIPPED"; MSG[$i]="${SKIP[$i]}"; SECS[$i]=0; AFTER[$i]="-"; BKROWS[$i]="-"
+            log "    SKIPPED: ${SKIP[$i]}"; continue
+        fi
         if run_table "$i"; then
+            [ "$SOURCE_TYPE" = flightsql ] && [ "$DRY_RUN" = no ] && flight_write_marker "$i"
             log "    ${STATUS[$i]}: target rows in the period ${TGT_CNT[$i]} -> ${AFTER[$i]} (source ${SRC_CNT[$i]}), backup rows ${BKROWS[$i]}, ${SECS[$i]}s"
         else
             failed=$((failed+1)); log "    FAILED: ${MSG[$i]}"

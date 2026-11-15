@@ -157,19 +157,33 @@ fails "flightsql as a target refused" vs_target
 
 SRC_T=(KPI_X KPI_Y); TGT_T=(KPI_X KPI_Y); FROM_TS="2026-10-25 00:00:00"; TO_TS="2026-10-25 02:00:00"; TIMEZONE=Australia/Sydney
 FLIGHT_MAX_ROWS=100000; FLIGHT_TIMEOUT_SECONDS=120; FLIGHT_SLICE_MINUTES=15; FLIGHT_PAUSE_SECONDS=2; EXPORT_OVERWRITE=no; EXPORT_ONLY=no
-FLIGHT_COUNT_MINUTES=0; FLIGHT_RETRIES=3; FLIGHT_RETRY_WAIT_SECONDS=5
+FLIGHT_COUNT_MINUTES=0; FLIGHT_RETRIES=3; FLIGHT_RETRY_WAIT_SECONDS=5; FLIGHT_COUNT=no
 TIME_COLUMN=PERIOD_START_TIME; TABLE_TIME_COLUMNS="KPI_Y:period_start_time"
 flight_py() {   # fake helper: records its arguments, answers like the real one
     printf '%s\n' "$*" >>"$T/flight_calls.txt"
     case "$1 $*" in
         "probe "*"--table KPI_X "*) printf 'TYPE,aware\nCOLUMN,PERIOD_START_TIME\nNCOLS,2\nSCOL,ID\nSCOL,PERIOD_START_TIME\nCOUNT,42\n' ;;
         "probe "*)                  printf 'TYPE,naive\nCOLUMN,period_start_time\nNCOLS,1\nSCOL,period_start_time\nCOUNT,7\n' ;;
-        "export "*"--table KPI_X "*) printf 'TYPE,aware\nCOLUMN,PERIOD_START_TIME\nNCOLS,2\nSLICE,1,2,20\nSLICE,2,2,22\nTOTAL,42\n' ;;
-        "export "*)                 printf 'TYPE,naive\nSLICE,1,1,9\nTOTAL,9\n' ;;
+        "export "*"--table KPI_X "*) printf 'TYPE,aware\nCOLUMN,PERIOD_START_TIME\nNCOLS,2\nSLICE,1,2,20,kept\nSLICE,2,2,22,new\nTOTAL,42\n' ;;
+        "export "*)                 printf 'TYPE,naive\nSLICE,1,1,9,new\nTOTAL,9\n' ;;
     esac
 }
-TMP="$T"; : >"$T/flight_calls.txt"
+TMP="$T"; EXPORT_DIR="$T/exp0"; : >"$T/flight_calls.txt"
+# default FLIGHT_COUNT=no: no count asked, source rows '-' until the export
 flight_probe_all >"$T/probe.out" 2>&1
+hasnt "probe: no --count by default"      "--count " "$(cat "$T/flight_calls.txt")"
+eq  "probe: no count -> '-' for table 1"  "-" "${SRC_CNT[0]}"
+has "probe: says rows are counted while read" "counted while they are read" "$(cat "$T/probe.out")"
+TGT_CNT=(5 5); LOAD_MODE=replace; EXPECT=(); : >"$T/flight_calls.txt"
+flight_export_all >"$T/export.out" 2>&1; OUT="$(cat "$T/export.out")"
+eq  "export (no count): total becomes the source count" "42" "${SRC_CNT[0]}"
+eq  "export (no count): expectation set from the total" "42" "${EXPECT[0]}"
+has "export: kept slice is shown as kept" "slice 1 of 2: 20 rows (kept from an earlier run)" "$OUT"
+has "export: rows read are logged"        "KPI_X: 42 rows read for the period" "$OUT"
+# FLIGHT_COUNT=yes: the old behaviour
+FLIGHT_COUNT=yes; : >"$T/flight_calls.txt"
+flight_probe_all >"$T/probe.out" 2>&1
+has "probe: --count when FLIGHT_COUNT=yes"  "probe --count " "$(cat "$T/flight_calls.txt")"
 eq  "probe: row count of table 1"       "42" "${SRC_CNT[0]}"
 eq  "probe: row count of table 2"       "7"  "${SRC_CNT[1]}"
 eq  "probe: kind of table 1"            "aware" "${FL_KIND[0]}"
@@ -188,7 +202,7 @@ LOAD_MODE=append;  set_expect 0; eq "set_expect append"  "47" "${EXPECT[0]}"
 LOAD_MODE=replace
 : >"$T/flight_calls.txt"
 flight_export_all >"$T/export.out" 2>&1; OUT="$(cat "$T/export.out")"
-has "export: slice progress is shown" "slice 2,2,22" "$OUT"
+has "export: slice progress is shown" "slice 2 of 2: 22 rows" "$OUT"
 has "export: slice size, pause and output folder are passed" "--slice-minutes 15 --pause-seconds 2" "$(cat "$T/flight_calls.txt")"
 hasnt "export: no --overwrite by default" "--overwrite" "$(cat "$T/flight_calls.txt")"
 eq  "export: total equals the count, no warning" "42" "${SRC_CNT[0]}"
@@ -197,7 +211,23 @@ eq  "export: expectation follows the new total"  "9"  "${EXPECT[1]}"
 has "export: warns when the data changed" "the earlier count said 7" "$OUT"
 EXPORT_OVERWRITE=yes; : >"$T/flight_calls.txt"; flight_export_all >/dev/null 2>&1
 has "export: --overwrite only when asked" "--overwrite" "$(cat "$T/flight_calls.txt")"
-EXPORT_OVERWRITE=no
+EXPORT_OVERWRITE=no; FLIGHT_COUNT=no
+
+# resume: a table imported into the same target for this period is skipped, another target is not
+TARGET_TYPE=postgres; TARGET_HOST=h; TARGET_PORT=5432; TARGET_DB=d; TARGET_SCHEMA=s; DRY_RUN=no
+mkdir -p "$EXPORT_DIR/KPI_X" "$EXPORT_DIR/KPI_Y"
+SRC_CNT=(42 9); flight_write_marker 0
+has "marker: names the target"  "target=h:5432/d/s.KPI_X" "$(cat "$EXPORT_DIR/KPI_X/_IMPORTED")"
+printf 'target=other:1/x/s.KPI_Y\nwhen=yesterday\n' >"$EXPORT_DIR/KPI_Y/_IMPORTED"
+SKIP=(); flight_mark_done
+has "resume: same target -> skipped"      "already imported on" "${SKIP[0]:-}"
+eq  "resume: other target -> not skipped" "" "${SKIP[1]:-}"
+: >"$T/flight_calls.txt"; flight_export_all >"$T/export.out" 2>&1
+hasnt "resume: skipped table is not exported" "--table KPI_X" "$(cat "$T/flight_calls.txt")"
+has   "resume: other table is exported"       "--table KPI_Y" "$(cat "$T/flight_calls.txt")"
+SKIP=(); EXPORT_OVERWRITE=yes; flight_mark_done; eq "resume: EXPORT_OVERWRITE=yes ignores markers" "" "${SKIP[0]:-}"
+SKIP=(); EXPORT_OVERWRITE=no; DRY_RUN=yes; flight_mark_done; eq "resume: dry-run ignores markers" "" "${SKIP[0]:-}"
+DRY_RUN=no; SKIP=()
 
 # EXPORT_KEEP
 X="$(mktemp -d)"; EXPORT_DIR="$X/exp"; mkdir -p "$EXPORT_DIR/KPI_X" "$EXPORT_DIR/KPI_Y" "$EXPORT_DIR/KEEP_ME"; : >"$EXPORT_DIR/KPI_X/a.parquet"
