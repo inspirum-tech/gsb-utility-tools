@@ -432,12 +432,14 @@ setup_flight() {
 
 flight_probe_all() { # one structure read and one count(*) per table; fills SRC_COLS, SRC_CNT, FL_COL, FL_KIND
     local i st tc out line
-    log "Flight SQL source $SOURCE_HOST:$SOURCE_PORT, schema $SOURCE_SCHEMA (structure and one row count per table)"
+    log "Flight SQL source $SOURCE_HOST:$SOURCE_PORT, schema $SOURCE_SCHEMA (structure and row count per table; count in chunks of ${FLIGHT_COUNT_MINUTES:-$FLIGHT_SLICE_MINUTES} min, $FLIGHT_RETRIES retries)"
     for i in "${!SRC_T[@]}"; do
         st="${SRC_T[$i]}"; tc="$(tcol_for "$st")"
         out="$(flight_py probe --host "$SOURCE_HOST" --port "$SOURCE_PORT" --schema "$SOURCE_SCHEMA" --table "$st" \
             --time-column "$tc" --from-local "$FROM_TS" --to-local "$TO_TS" --timezone "$TIMEZONE" \
-            --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS")" \
+            --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS" \
+            --slice-minutes "$FLIGHT_SLICE_MINUTES" --count-minutes "$FLIGHT_COUNT_MINUTES" \
+            --retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS")" \
             || die "Flight SQL: cannot read $st (see the error above). Nothing was changed."
         SRC_COLS[$i]=""; FL_COL[$i]=""; FL_KIND[$i]=""; SRC_CNT[$i]=""
         while IFS= read -r line; do
@@ -467,6 +469,7 @@ flight_export_all() { # reads every table slice by slice into EXPORT_DIR/<TABLE>
                 --time-column "$tc" --from-local "$FROM_TS" --to-local "$TO_TS" --timezone "$TIMEZONE" \
                 --slice-minutes "$FLIGHT_SLICE_MINUTES" --pause-seconds "$FLIGHT_PAUSE_SECONDS" \
                 --max-rows "$FLIGHT_MAX_ROWS" --timeout-seconds "$FLIGHT_TIMEOUT_SECONDS" \
+                --retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS" \
                 --out-dir "$EXPORT_DIR" $ow | tee "$TMP/fl_$i.out" | sed -n 's/^SLICE,/        slice /p'; then
             die "reading $st from the API stopped (the reason is in the error above). Nothing was imported."
         fi
@@ -502,12 +505,16 @@ load_config() {
     : "${TIME_COLUMN:=PERIOD_START_TIME}" "${TABLE_TIME_COLUMNS:=}" "${FULL_COPY_TABLES:=}"
     : "${PERIOD_FROM:=}" "${PERIOD_TO:=}" "${TABLES:=}" "${ON_ERROR:=stop}"
     : "${TIMEZONE:=UTC}"
-    : "${FLIGHT_SLICE_MINUTES:=10}" "${FLIGHT_PAUSE_SECONDS:=2}" "${FLIGHT_MAX_ROWS:=100000}" "${FLIGHT_TIMEOUT_SECONDS:=120}"
+    : "${FLIGHT_SLICE_MINUTES:=15}" "${FLIGHT_PAUSE_SECONDS:=2}" "${FLIGHT_MAX_ROWS:=100000}" "${FLIGHT_TIMEOUT_SECONDS:=120}"
+    : "${FLIGHT_COUNT_MINUTES:=0}" "${FLIGHT_RETRIES:=3}" "${FLIGHT_RETRY_WAIT_SECONDS:=5}"
     : "${EXPORT_DIR:=}" "${EXPORT_KEEP:=yes}" "${EXPORT_OVERWRITE:=no}" "${PYTHON:=python3}"
     : "${OFFLINE:=yes}" "${DUCKDB:=duckdb}" "${DUCKDB_EXTENSION_DIR:=}" "${BUNDLE_DIR:=$HERE/bundle}" "${REPORT_DIR:=$HERE/reports}"
 }
 
 validate_config() {
+    if [ "$SOURCE_TYPE" = flightsql ] && [ -n "$SOURCE_PASSWORD_ENV" ]; then
+        warn "SOURCE_PASSWORD_ENV is ignored for a flightsql source (the API has no login)"; SOURCE_PASSWORD_ENV=""
+    fi
     validate_side SOURCE
     if [ "${EXPORT_ONLY:-no}" = yes ]; then
         [ "$SOURCE_TYPE" = flightsql ] || die "--export-only needs SOURCE_TYPE=flightsql"
@@ -526,6 +533,10 @@ validate_config() {
             [[ "$(v "$n")" =~ ^[1-9][0-9]*$ ]] || die "$n must be a whole number of 1 or more; got '$(v "$n")'"
         done
         [[ "$FLIGHT_PAUSE_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "FLIGHT_PAUSE_SECONDS must be a number of seconds (0 or more); got '$FLIGHT_PAUSE_SECONDS'"
+        [[ "$FLIGHT_RETRY_WAIT_SECONDS" =~ ^[0-9]+(\.[0-9]+)?$ ]] || die "FLIGHT_RETRY_WAIT_SECONDS must be a number of seconds (0 or more); got '$FLIGHT_RETRY_WAIT_SECONDS'"
+        for n in FLIGHT_COUNT_MINUTES FLIGHT_RETRIES; do
+            [[ "$(v "$n")" =~ ^[0-9]+$ ]] || die "$n must be a whole number (0 or more); got '$(v "$n")'"
+        done
         case "$EXPORT_KEEP" in yes|no) ;; *) die "EXPORT_KEEP must be yes or no";; esac
         case "$EXPORT_OVERWRITE" in yes|no) ;; *) die "EXPORT_OVERWRITE must be yes or no";; esac
         check_re PYTHON "$PYTHON" "$re_path"

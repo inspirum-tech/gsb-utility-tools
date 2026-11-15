@@ -87,7 +87,7 @@ Everything is in the config file; [config.example.env](config.example.env) docum
 | `BACKUP` | `on` (default) or `off`. On = the replaced rows are saved in `BACKUP_SCHEMA."<table>_bak_<date_time>"` in the target database. Off = no backup, a warning is printed |
 | `ON_ERROR` | `stop` (default) or `continue` with the next table |
 | `OFFLINE` | `yes` (default) or `no` |
-| `FLIGHT_*`, `EXPORT_*`, `PYTHON` | only for `SOURCE_TYPE="flightsql"`: row cap, slice size, pause, where the exported files go and whether they are kept. See RUNBOOK section 3.5 |
+| `FLIGHT_*`, `EXPORT_*`, `PYTHON` | only for `SOURCE_TYPE="flightsql"`: row cap, slice size, chunked row count, retries, pause, where the exported files go and whether they are kept. See RUNBOOK section 3.5 |
 
 ## Safety checks (before anything is written)
 

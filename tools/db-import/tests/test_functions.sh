@@ -143,6 +143,12 @@ vs_badhost()  { SOURCE_HOST="a b;x";       validate_side SOURCE; }
 vs_badport()  { SOURCE_PORT="88x";         validate_side SOURCE; }
 vs_target()   { TARGET_TYPE=flightsql; TARGET_HOST=localhost; TARGET_PORT=8815; TARGET_SCHEMA=s; validate_side TARGET; }
 fails "flightsql: port required"      vs_noport
+has "flightsql: probe passes retries"      '--retries "$FLIGHT_RETRIES" --retry-wait "$FLIGHT_RETRY_WAIT_SECONDS"' "$(declare -f flight_probe_all)"
+has "flightsql: probe passes count chunk"  '--count-minutes "$FLIGHT_COUNT_MINUTES"' "$(declare -f flight_probe_all)"
+has "flightsql: export passes retries"     '--retries "$FLIGHT_RETRIES"' "$(declare -f flight_export_all)"
+SOURCE_PASSWORD_ENV=SOME_UNSET_VAR; TARGET_TYPE=postgres; TARGET_DB=g; TARGET_SCHEMA=s; TARGET_ENV=uat; TABLES=KPI_X; PERIOD_FROM=2026-11-01; PERIOD_TO=2026-11-02
+has "flightsql: SOURCE_PASSWORD_ENV is ignored, not fatal" "SOURCE_PASSWORD_ENV is ignored" "$( (validate_config) 2>&1 || true)"
+SOURCE_PASSWORD_ENV=
 fails "flightsql: host required"      vs_nohost
 fails "flightsql: schema required"    vs_noschema
 fails "flightsql: bad host refused"   vs_badhost
@@ -150,7 +156,8 @@ fails "flightsql: bad port refused"   vs_badport
 fails "flightsql as a target refused" vs_target
 
 SRC_T=(KPI_X KPI_Y); TGT_T=(KPI_X KPI_Y); FROM_TS="2026-10-25 00:00:00"; TO_TS="2026-10-25 02:00:00"; TIMEZONE=Australia/Sydney
-FLIGHT_MAX_ROWS=100000; FLIGHT_TIMEOUT_SECONDS=120; FLIGHT_SLICE_MINUTES=10; FLIGHT_PAUSE_SECONDS=2; EXPORT_OVERWRITE=no; EXPORT_ONLY=no
+FLIGHT_MAX_ROWS=100000; FLIGHT_TIMEOUT_SECONDS=120; FLIGHT_SLICE_MINUTES=15; FLIGHT_PAUSE_SECONDS=2; EXPORT_OVERWRITE=no; EXPORT_ONLY=no
+FLIGHT_COUNT_MINUTES=0; FLIGHT_RETRIES=3; FLIGHT_RETRY_WAIT_SECONDS=5
 TIME_COLUMN=PERIOD_START_TIME; TABLE_TIME_COLUMNS="KPI_Y:period_start_time"
 flight_py() {   # fake helper: records its arguments, answers like the real one
     printf '%s\n' "$*" >>"$T/flight_calls.txt"
@@ -182,7 +189,7 @@ LOAD_MODE=replace
 : >"$T/flight_calls.txt"
 flight_export_all >"$T/export.out" 2>&1; OUT="$(cat "$T/export.out")"
 has "export: slice progress is shown" "slice 2,2,22" "$OUT"
-has "export: slice size, pause and output folder are passed" "--slice-minutes 10 --pause-seconds 2" "$(cat "$T/flight_calls.txt")"
+has "export: slice size, pause and output folder are passed" "--slice-minutes 15 --pause-seconds 2" "$(cat "$T/flight_calls.txt")"
 hasnt "export: no --overwrite by default" "--overwrite" "$(cat "$T/flight_calls.txt")"
 eq  "export: total equals the count, no warning" "42" "${SRC_CNT[0]}"
 eq  "export: table 2 total replaces the count"   "9"  "${SRC_CNT[1]}"

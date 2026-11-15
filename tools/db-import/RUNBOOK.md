@@ -186,7 +186,10 @@ The tool asks the API for the period in small time slices, saves them as parquet
 | `SOURCE_SCHEMA` | the schema on the API, e.g. `gsb_data_kpi_pivot` | |
 | `TABLES`, `PERIOD_FROM`, `PERIOD_TO`, `TIMEZONE` | as for every job (`TIMEZONE="Australia/Sydney"`) | |
 | `FLIGHT_MAX_ROWS` | the API's row cap (`FLIGHTSQL__MAX_ROWS` on the API: ask its owner). A slice that returns this many rows **or more** fails the table, because the API cuts a bigger result silently | 100000 |
-| `FLIGHT_SLICE_MINUTES` | length of one time slice | 10 |
+| `FLIGHT_SLICE_MINUTES` | length of one time slice (15 = exactly one quarter-hour timestamp per slice for the `QRLY` tables) | 15 |
+| `FLIGHT_COUNT_MINUTES` | `--check` counts the rows in chunks of this many minutes and adds them up; one `count(*)` over days of a big table exceeds the API time limit. 0 = same as `FLIGHT_SLICE_MINUTES` | 0 |
+| `FLIGHT_RETRIES` | how many times a query that hit the time limit or lost the connection (tunnel hiccup) is retried; the connection is re-opened first. Other errors are not retried | 3 |
+| `FLIGHT_RETRY_WAIT_SECONDS` | wait before the first retry, doubled each time (5, 10, 20 s) | 5 |
 | `FLIGHT_PAUSE_SECONDS` | wait between two slices, so the API (which prod users share) is not loaded | 2 |
 | `FLIGHT_TIMEOUT_SECONDS` | time limit of one query | 120 |
 | `EXPORT_DIR` | where the parquet files go, as `<EXPORT_DIR>/<TABLE>/*.parquet` | `reports/<run>/export` |
@@ -210,7 +213,10 @@ There is no `SOURCE_PASSWORD_ENV` for this source (the API has no login). The ti
 - The time filter is built by the tool from the period (as exact UTC instants for columns with a time zone, as local time for columns without one). It is not the API's own time conversion, which shifts a plain filter by 11 hours on some tables. You do not need to do anything.
 - The query is always `SELECT * FROM <schema>."<table>" WHERE <time column> in the slice`. You choose tables and period; you cannot add other filters.
 - Only a time column of type timestamp is supported. Another type, or a table without the column, stops the run with a message.
-- The row cap: pick `FLIGHT_SLICE_MINUTES` so that one slice is far below `FLIGHT_MAX_ROWS`. If it still fails, lower it. The data of one single time stamp cannot be split further.
+- The row cap: pick `FLIGHT_SLICE_MINUTES` so that one slice is far below `FLIGHT_MAX_ROWS`. If it still fails, lower it. The data of one single time stamp cannot be split further:
+  for a quarter-hourly table, rows in the period / (4 x 24 x days) = rows per time stamp; if that is at or above the cap, the table cannot be read through the API until its `FLIGHTSQL__MAX_ROWS` is raised.
+  `--check` prints the rows in the period per table, so you can do this sum before exporting.
+- `TIMEOUT ... context deadline exceeded` during `--check`: the count of one chunk took longer than `FLIGHT_TIMEOUT_SECONDS`. The retries kick in first; if it still fails, lower `FLIGHT_COUNT_MINUTES` or raise the time limit.
 
 ## 4. Passwords
 

@@ -121,6 +121,54 @@ class T(unittest.TestCase):
         self.assertIsNotNone(pat.search("PERIOD_START_TIME >= '2026-10-24 13:00:00'"))
         self.assertIsNotNone(pat.search("PERIOD_START_TIME >= TIMESTAMP '2026-10-24T13:00:00Z'"))
 
+    def test_transient_errors_are_recognised(self):
+        self.assertTrue(fx.is_transient("TIMEOUT: [FlightSQL] context deadline exceeded (DeadlineExceeded; DoGet: endpoint 0: [])"))
+        self.assertTrue(fx.is_transient("rpc error: code = Unavailable desc = connection reset by peer"))
+        self.assertFalse(fx.is_transient("Catalog Error: Table with name KPI_X does not exist"))
+        self.assertFalse(fx.is_transient("Parser Error: syntax error at or near"))
+
+    def test_retry_waits_double(self):
+        self.assertEqual(fx.retry_waits(3, 5), [5, 10, 20])
+        self.assertEqual(fx.retry_waits(0, 5), [])
+
+    def test_retry_reconnects_then_succeeds_and_gives_up_on_other_errors(self):
+        calls = {"run": 0, "connect": 0}
+
+        class FakeApi(fx.Api):
+            def __init__(self):
+                self.retries, self.retry_wait, self.con = 2, 0, None
+                self.plan = []
+
+            def connect(self):
+                calls["connect"] += 1
+
+            def run_once(self, sql):
+                calls["run"] += 1
+                outcome = self.plan.pop(0)
+                if isinstance(outcome, Exception):
+                    raise outcome
+                return outcome
+
+        a = FakeApi()
+        a.plan = [RuntimeError("context deadline exceeded"), RuntimeError("Unavailable"), "ok"]
+        self.assertEqual(a.run("SELECT 1"), "ok")
+        self.assertEqual((calls["run"], calls["connect"]), (3, 2))
+        a.plan = [RuntimeError("context deadline exceeded")] * 3
+        with self.assertRaises(fx.HelperError) as cm:
+            a.run("SELECT 2")
+        self.assertIn("after 2 retries", str(cm.exception))
+        a.plan = [RuntimeError("Catalog Error: table missing")]
+        before = calls["run"]
+        with self.assertRaises(fx.HelperError):
+            a.run("SELECT 3")
+        self.assertEqual(calls["run"], before + 1)   # not retried
+
+    def test_count_chunks_cover_the_window_exactly(self):
+        chunks = fx.make_slices(fx.parse_local("2026-11-01 00:00:00"), fx.parse_local("2026-11-03 00:00:00"), 15, "Australia/Sydney", "aware")
+        self.assertEqual(len(chunks), 192)
+        for (a, b), (c, d) in zip(chunks, chunks[1:]):
+            self.assertEqual(b, c)
+
     def test_slice_file_names_sort_in_order(self):
         names = [fx.slice_file_name(i, "aware", dt.datetime(2026, 1, 1, tzinfo=UTC)) for i in (1, 2, 10, 100)]
         self.assertEqual(names, sorted(names))

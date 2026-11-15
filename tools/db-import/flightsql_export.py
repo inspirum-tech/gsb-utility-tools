@@ -11,8 +11,13 @@ Standalone: only the Python standard library plus `pyarrow` and `adbc-driver-fli
 bundle/pylibs on a machine without internet). Python 3.9 or newer.
 
 Commands (all read-only towards the API):
-  probe   read the table structure (SELECT ... LIMIT 0) and one count(*) of the window
+  probe   read the table structure (SELECT ... LIMIT 0) and count the rows of the window, in chunks
+          of --count-minutes (one count(*) over days of data times out on the big tables)
   export  probe, then read the window slice by slice and write the parquet files
+
+Every query is retried (--retries, waiting --retry-wait seconds, doubled each time) when the API
+times out or the connection drops; the connection is re-opened before the retry. Other errors
+(bad SQL, unknown table) are not retried.
 
 Output lines on stdout (machine readable, one per line):
   TYPE,<aware|naive>   COLUMN,<name>   NCOLS,<n>   SCOL,<column name> (one per column)
@@ -145,35 +150,84 @@ def slice_file_name(index, kind, lo):
 # ---------------------------------------------------------------------------------------------
 # the API (imports pyarrow / adbc only here)
 # ---------------------------------------------------------------------------------------------
-def connect(host, port, timeout):
-    try:
-        import adbc_driver_flightsql.dbapi as fl
-    except ImportError as e:
-        raise HelperError("adbc_driver_flightsql / pyarrow are not installed (%s). On a machine without internet use the bundle/pylibs folder." % e, 4)
-    secs = str(int(timeout))
-    opts = {"adbc.flight.sql.rpc.timeout_seconds.fetch": secs,
-            "adbc.flight.sql.rpc.timeout_seconds.query": secs}
-    try:
-        return fl.connect("grpc://%s:%s" % (host, port), db_kwargs=opts)
-    except Exception as e:
-        raise HelperError("cannot connect to the Flight SQL API at %s:%s: %s" % (host, port, str(e)[:300]), 4)
+TRANSIENT = ("deadline exceeded", "timeout", "timed out", "unavailable", "connection reset", "broken pipe",
+             "connection refused", "eof", "goaway", "transport", "socket closed", "cancelled", "canceled")
 
 
-def run(con, sql):
-    cur = con.cursor()
-    try:
-        cur.execute(sql)
-        return cur.fetch_arrow_table()
-    except Exception as e:
-        raise HelperError("the API rejected or failed a query: %s | %s" % (str(e)[:300], sql[:200]), 4)
-    finally:
-        cur.close()
+def is_transient(text):
+    """True for errors worth a retry (time limit, tunnel or network hiccup)."""
+    t = str(text).lower()
+    return any(k in t for k in TRANSIENT)
+
+
+def retry_waits(retries, first_wait):
+    """Seconds to wait before retry 1..n: first_wait, doubled each time."""
+    return [first_wait * (2 ** i) for i in range(max(0, retries))]
+
+
+class Api:
+    """One connection to the API that re-opens itself and retries transient failures."""
+
+    def __init__(self, host, port, timeout, retries=3, retry_wait=5.0):
+        self.host, self.port, self.timeout = host, port, timeout
+        self.retries, self.retry_wait = retries, retry_wait
+        self.con = None
+        self.connect()
+
+    def connect(self):
+        self.close()
+        try:
+            import adbc_driver_flightsql.dbapi as fl
+        except ImportError as e:
+            raise HelperError("adbc_driver_flightsql / pyarrow are not installed (%s). On a machine without internet use the bundle/pylibs folder." % e, 4)
+        secs = str(int(self.timeout))
+        opts = {"adbc.flight.sql.rpc.timeout_seconds.fetch": secs,
+                "adbc.flight.sql.rpc.timeout_seconds.query": secs}
+        try:
+            self.con = fl.connect("grpc://%s:%s" % (self.host, self.port), db_kwargs=opts)
+        except Exception as e:
+            raise HelperError("cannot connect to the Flight SQL API at %s:%s: %s" % (self.host, self.port, str(e)[:300]), 4)
+
+    def close(self):
+        if self.con is not None:
+            try:
+                self.con.close()
+            except Exception:
+                pass
+            self.con = None
+
+    def run_once(self, sql):
+        cur = self.con.cursor()
+        try:
+            cur.execute(sql)
+            return cur.fetch_arrow_table()
+        finally:
+            cur.close()
+
+    def run(self, sql):
+        waits = retry_waits(self.retries, self.retry_wait)
+        attempt = 0
+        while True:
+            try:
+                return self.run_once(sql)
+            except Exception as e:
+                text = str(e)
+                if attempt >= len(waits) or not is_transient(text):
+                    what = "after %d retries " % attempt if attempt else ""
+                    raise HelperError("the API rejected or failed a query %s: %s | %s" % (what, text[:300], sql[:200]), 4)
+                err("  retry %d of %d in %gs (%s)" % (attempt + 1, len(waits), waits[attempt], text[:120].replace("\n", " ")))
+                time.sleep(waits[attempt])
+                attempt += 1
+                try:
+                    self.connect()
+                except HelperError as ce:
+                    err("  reconnect failed: %s" % ce)   # the next loop turn raises or retries again
 
 
 def probe(con, args):
     """-> (real time column name, kind, number of columns)"""
     ref = table_ref(args.schema, args.table)
-    schema = run(con, "SELECT * FROM %s LIMIT 0" % ref).schema
+    schema = con.run("SELECT * FROM %s LIMIT 0" % ref).schema
     fields = [(f.name, str(f.type)) for f in schema]
     name, kind = find_time_column(fields, args.time_column)
     print("TYPE,%s" % kind)
@@ -186,11 +240,18 @@ def probe(con, args):
 
 
 def window_count(con, args, col, kind):
+    """count(*) of the window in chunks of --count-minutes (default: the export slice), summed.
+    One count over days of a big table exceeds the API time limit; a 15-minute chunk never does."""
     from_l, to_l = parse_local(args.from_local), parse_local(args.to_local)
-    slices = make_slices(from_l, to_l, 100000000, args.timezone, kind)   # one slice = the whole window
-    lo, hi = slices[0][0], slices[-1][1]
-    sql = "SELECT count(*) AS n FROM %s WHERE %s" % (table_ref(args.schema, args.table), where_clause(kind, col, lo, hi))
-    n = run(con, sql).to_pylist()[0]["n"]
+    minutes = args.count_minutes or args.slice_minutes
+    chunks = make_slices(from_l, to_l, minutes, args.timezone, kind)
+    ref = table_ref(args.schema, args.table)
+    n, started = 0, time.time()
+    for i, (lo, hi) in enumerate(chunks, 1):
+        sql = "SELECT count(*) AS n FROM %s WHERE %s" % (ref, where_clause(kind, col, lo, hi))
+        n += con.run(sql).to_pylist()[0]["n"]
+        if i % 50 == 0 or i == len(chunks):
+            err("  counted %d of %d chunks: %d rows so far (%.0fs)" % (i, len(chunks), n, time.time() - started))
     print("COUNT,%d" % n, flush=True)
     return n
 
@@ -210,7 +271,7 @@ def export(con, args, col, kind):
     slices = make_slices(parse_local(args.from_local), parse_local(args.to_local), args.slice_minutes, args.timezone, kind)
     total = 0
     for i, (lo, hi) in enumerate(slices, 1):
-        table = run(con, "SELECT * FROM %s WHERE %s" % (ref, where_clause(kind, col, lo, hi)))
+        table = con.run("SELECT * FROM %s WHERE %s" % (ref, where_clause(kind, col, lo, hi)))
         n = table.num_rows
         if n >= args.max_rows:
             raise HelperError(
@@ -246,10 +307,13 @@ def parse_args(argv):
     p.add_argument("--from-local", required=True, help="period start 'YYYY-MM-DD HH:MM:SS' in --timezone")
     p.add_argument("--to-local", required=True, help="period end (not included)")
     p.add_argument("--timezone", default="Australia/Sydney")
-    p.add_argument("--slice-minutes", type=int, default=10)
+    p.add_argument("--slice-minutes", type=int, default=15)
+    p.add_argument("--count-minutes", type=int, default=0, help="probe: chunk size of the count(*); 0 = --slice-minutes")
     p.add_argument("--pause-seconds", type=float, default=2)
     p.add_argument("--max-rows", type=int, default=100000)
     p.add_argument("--timeout-seconds", type=int, default=120)
+    p.add_argument("--retries", type=int, default=3, help="retries of a query after a time limit or network error")
+    p.add_argument("--retry-wait", type=float, default=5, help="seconds before the first retry; doubled each time")
     p.add_argument("--out-dir", help="export only: parent folder; files go to <out-dir>/<table>/")
     p.add_argument("--overwrite", action="store_true")
     p.add_argument("--no-count", action="store_true", help="probe only: skip the count(*) query")
@@ -269,7 +333,9 @@ def main(argv=None):
             raise HelperError("export needs --out-dir")
         if args.max_rows < 1 or args.slice_minutes < 1:
             raise HelperError("--max-rows and --slice-minutes must be 1 or more")
-        con = connect(args.host, args.port, args.timeout_seconds)
+        if args.count_minutes < 0 or args.retries < 0 or args.retry_wait < 0:
+            raise HelperError("--count-minutes, --retries and --retry-wait must be 0 or more")
+        con = Api(args.host, args.port, args.timeout_seconds, args.retries, args.retry_wait)
         try:
             col, kind, _ = probe(con, args)
             if args.command == "probe":
