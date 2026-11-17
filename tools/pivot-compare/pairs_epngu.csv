@@ -1,0 +1,2 @@
+name,old_table,new_table,key_cols,info_cols
+NODE_EPNGU,KPI_NS_QRLY_NODE_EPNGU_ERS_P,KPI_NS_QRLY_NODE_EPNGU_ERS_NEW_P,SITE_NAME;EPNGU,SITE_ID
