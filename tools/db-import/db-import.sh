@@ -8,7 +8,8 @@
 #   --export-only  SOURCE_TYPE=flightsql only: fetch the data into EXPORT_DIR (parquet files), touch no database
 #   --yes          do not ask for confirmation when TARGET_ENV=prod (for unattended runs)
 #
-# Source: postgres | duckdb | ducklake | parquet | flightsql.  Target: postgres | duckdb | ducklake.
+# Source: postgres | duckdb | ducklake | parquet | flightsql | csv.  Target: postgres | duckdb | ducklake.
+# csv = the zip (or folder) of CSV files downloaded from prod: no connection to prod at all (SOURCE_CSV_PATH).
 # flightsql = the gsb-kpi-data-api Flight SQL interface, read in small time slices by flightsql_export.py
 # (python3 + pyarrow + adbc-driver-flightsql from bundle/pylibs); the files are then imported like parquet.
 # Postgres -> Postgres uses psql only. Every other combination uses the DuckDB CLI, with its
@@ -137,6 +138,7 @@ side_fingerprint() {
         duckdb)            printf '%s' "$(v "${P}_DB_FILE")" ;;
         parquet)           printf 'parquet:%s' "$(v "${P}_PARQUET_GLOB")" ;;
         flightsql)         printf 'flightsql:%s:%s' "$(v "${P}_HOST")" "$(v "${P}_PORT")" ;;
+        csv)               printf 'csv:%s' "$(v "${P}_CSV_PATH")" ;;
     esac
 }
 
@@ -174,11 +176,15 @@ validate_side() {
             check_re "${P}_HOST" "$(v "${P}_HOST")" "$re_host"
             check_re "${P}_PORT" "$(v "${P}_PORT")" "$re_port"
             check_re "${P}_SCHEMA" "$(v "${P}_SCHEMA")" "$re_ident" ;;
+        csv)
+            [ "$P" = SOURCE ] || die "TARGET_TYPE=csv is not supported (csv can only be a source)"
+            [ -n "$(v "${P}_CSV_PATH")" ] || die "${P}_CSV_PATH is not set (a .zip file, or the folder with the downloaded CSV files)"
+            check_re "${P}_CSV_PATH" "$(v "${P}_CSV_PATH")" "$re_path" ;;
         parquet)
             [ "$P" = SOURCE ] || die "TARGET_TYPE=parquet is not supported (parquet can only be a source)"
             [ -n "$(v "${P}_PARQUET_GLOB")" ] || die "${P}_PARQUET_GLOB is not set (example: /data/{TABLE}/*.parquet)"
             check_re "${P}_PARQUET_GLOB" "$(v "${P}_PARQUET_GLOB")" "$re_path" ;;
-        *) die "${P}_TYPE must be postgres, duckdb, ducklake, parquet or flightsql (target: only postgres, duckdb, ducklake); got '$type'" ;;
+        *) die "${P}_TYPE must be postgres, duckdb, ducklake, parquet, flightsql or csv (target: only postgres, duckdb, ducklake); got '$type'" ;;
     esac
     pwval "$P" >/dev/null
 }
@@ -261,7 +267,7 @@ duck_attach() { # side readonly(yes|no)
         ducklake) printf "ATTACH 'ducklake:postgres:%s' AS %s (DATA_PATH '%s', METADATA_SCHEMA '%s'%s);\n" \
                       "$(sqlq "$(pg_conninfo "$P")")" "$alias" "$(sqlq "$(v "${P}_DUCKLAKE_DATA_PATH")")" \
                       "$(sqlq "$(v "${P}_DUCKLAKE_METADATA_SCHEMA")")" "$opt" ;;
-        parquet|flightsql) : ;;   # read with read_parquet() (flightsql: the exported files), nothing to attach
+        parquet|flightsql|csv) : ;;   # read with read_parquet() / read_csv() (flightsql: the exported files), nothing to attach
     esac
 }
 
@@ -295,6 +301,8 @@ tbl_expr() { # side table
         printf "read_parquet('%s')" "$(sqlq "${g//\{TABLE\}/$t}")"
     elif [ "$(v "${P}_TYPE")" = flightsql ]; then
         printf "read_parquet('%s')" "$(sqlq "$EXPORT_DIR/$t/*.parquet")"
+    elif [ "$(v "${P}_TYPE")" = csv ]; then
+        printf "read_csv(%s, header=true, all_varchar=true)" "$(csv_list_sql "$t")"
     else
         printf '%s."%s"."%s"' "$alias" "$(v "${P}_SCHEMA")" "$t"
     fi
@@ -313,9 +321,12 @@ BEGIN;
 CREATE TABLE tgt.\"$BACKUP_SCHEMA\".\"${BK_NAME[$i]}\" AS SELECT * FROM $T $w;
 "
     fi
+    local ddl; ddl="$(struct_ddl "$i")"
+    if [ -n "$ddl" ]; then sql+="$ddl"$'\n'; fi
     if [ "$LOAD_MODE" = replace ]; then sql+="DELETE FROM $T $w;
 "; fi
-    sql+="INSERT INTO $T ($cols_q) SELECT $cols_q FROM $S $w;
+    local sel="$cols_q"; [ "${SOURCE_TYPE:-}" != csv ] || sel="$(csv_select_list "$i")"
+    sql+="INSERT INTO $T ($cols_q) SELECT $sel FROM $S $w;
 SELECT CASE WHEN (SELECT count(*) FROM $T $w) = ${EXPECT[$i]}
             THEN 'RESULT,' || ${EXPECT[$i]}
             ELSE error('row count check failed: expected ${EXPECT[$i]}') END;
@@ -469,6 +480,425 @@ flight_cleanup() { # EXPORT_KEEP=no: remove the table folders this run wrote
     return 0
 }
 
+# ---------------------------------------------------------------------------------------------
+# Source "csv": the files downloaded from prod (a .zip, or the extracted folder) with one file per table
+# and time range, named <TABLE>_<YYYY-MM-DD_HH_MM_SS>__to__<YYYY-MM-DD_HH_MM_SS>.csv[.gz] and a
+# _manifest.csv (file,rows) next to them. DuckDB's read_csv reads them (every column as text, cast to the
+# target's column types on insert). Settings: SOURCE_CSV_PATH and CSV_* (config.example.env).
+# ---------------------------------------------------------------------------------------------
+declare -A CSV_FILES TGT_TY       # table -> newline separated files in the period;  "i|column" -> target type
+CSV_DIR=""; CSV_EXTRACTED=no; CSV_PROBLEMS=0; CSV_ALL=""; CSV_AUTO=no
+PERIOD_AUTO_FROM=no; PERIOD_AUTO_TO=no      # PERIOD_FROM / PERIOD_TO = "auto": from the first / to the last row of each table's files
+declare -a TBL_FROM TBL_TO                  # the period of each table (the global one, or the files' own when "auto")
+
+# KPI_X_2026-10-25_00_00_00__to__2026-10-25_01_00_00.csv.gz  ->  KPI_X|2026-10-25 00:00:00|2026-10-25 01:00:00
+csv_parse_name() {
+    local f re
+    f="$(basename "$1")"
+    re='^(.+)_([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})_([0-9]{2})_([0-9]{2})__to__([0-9]{4}-[0-9]{2}-[0-9]{2})_([0-9]{2})_([0-9]{2})_([0-9]{2})\.csv(\.gz)?$'
+    [[ "$f" =~ $re ]] || return 1
+    printf '%s|%s %s:%s:%s|%s %s:%s:%s' "${BASH_REMATCH[1]}" \
+        "${BASH_REMATCH[2]}" "${BASH_REMATCH[3]}" "${BASH_REMATCH[4]}" "${BASH_REMATCH[5]}" \
+        "${BASH_REMATCH[6]}" "${BASH_REMATCH[7]}" "${BASH_REMATCH[8]}" "${BASH_REMATCH[9]}"
+}
+
+# stdin: "from|to" lines of one table; $1 $2 = the period. Prints what is wrong (nothing = the files cover the period once)
+csv_gaps() {
+    local LC_ALL=C wf="$1" wt="$2" cur="$1" prev="" f t
+    while IFS='|' read -r f t; do
+        [ -n "$f" ] || continue
+        if [ -n "$prev" ] && [[ "$f" < "$prev" ]]; then echo "two files overlap: one starts at $f, the one before it ends at $prev"; fi
+        if [ -z "$prev" ] || [[ "$f" > "$prev" ]]; then
+            if [[ "$f" > "$cur" ]]; then echo "no file for $cur to $f"; fi
+        fi
+        if [ -z "$prev" ] || [[ "$t" > "$prev" ]]; then prev="$t"; fi
+        if [[ "$t" > "$cur" ]]; then cur="$t"; fi
+    done < <(sort)
+    if [[ "$cur" < "$wt" ]]; then echo "no file for $cur to $wt"; fi
+    return 0
+}
+
+csv_problem() { # message: an error (counted, the run stops later) unless CSV_INCOMPLETE=warn
+    if [ "${CSV_INCOMPLETE:-error}" = warn ]; then warn "$1"; else echo "ERROR: $1" >&2; CSV_PROBLEMS=$((CSV_PROBLEMS+1)); fi
+}
+
+csv_list_sql() { # table -> ['file1','file2']
+    local f out=""
+    while IFS= read -r f; do [ -n "$f" ] || continue; out+="${out:+,}'$(sqlq "$f")'"; done <<<"${CSV_FILES[$1]:-}"
+    printf '[%s]' "$out"
+}
+
+csv_skip_note() { # table "col1 col2 ..." : EXTRA_SOURCE_COLUMNS=skip
+    local n; n="$(wc -w <<<"$2")"
+    warn "$1: $n source column(s) are not in the target and are NOT loaded (EXTRA_SOURCE_COLUMNS=skip): $(cut -d' ' -f1-6 <<<"$2")$([ "$n" -gt 6 ] && echo ' ...')"
+    [ -z "${RUN_DIR:-}" ] || printf '%s: %s\n' "$1" "$2" >>"$RUN_DIR/skipped_columns.txt"
+}
+
+csv_select_list() { # i -> CAST("col" AS <target type>) AS "col", ... for the columns that are loaded
+    local i="$1" c ty out=""
+    while IFS= read -r c; do
+        [ -n "$c" ] || continue
+        ty="${TGT_TY["$i|$c"]:-}"
+        [ -n "$ty" ] || die "the type of target column ${TGT_T[$i]}.$c is not known"
+        out+="${out:+, }CAST(\"$c\" AS $ty) AS \"$c\""
+    done <<<"${COMMON[$i]}"
+    printf '%s' "$out"
+}
+
+csv_extract() { # SOURCE_CSV_PATH is a .zip: unzip it once into CSV_WORK_DIR (default: the run's temp folder)
+    local z="$SOURCE_CSV_PATH" base="${CSV_WORK_DIR:-$TMP}" need free
+    CSV_DIR="$base/extract_$RUN_TS"
+    mkdir -p "$CSV_DIR" || die "cannot create $CSV_DIR (set CSV_WORK_DIR=<a folder with enough space>)"
+    CSV_EXTRACTED=yes
+    need=$(( $(stat -c %s "$z") / 1024 * 11 / 10 + 1 ))
+    free="$(df -Pk "$CSV_DIR" | awk 'NR==2{print $4}')"
+    [[ "$free" =~ ^[0-9]+$ ]] && [ "$free" -ge "$need" ] \
+        || die "not enough free space in $base for the zip (needs about $((need/1024)) MB, free: $((${free:-0}/1024)) MB). Set CSV_WORK_DIR=<a folder with more space>, or unzip it yourself and point SOURCE_CSV_PATH at the folder."
+    log "unzipping $z into $CSV_DIR (once)"
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -q -o "$z" -d "$CSV_DIR" || die "unzip failed (is the zip complete? check its size and checksum)"
+    elif command -v "$PYTHON" >/dev/null 2>&1; then
+        "$PYTHON" -c 'import sys, zipfile; zipfile.ZipFile(sys.argv[1]).extractall(sys.argv[2])' "$z" "$CSV_DIR" \
+            || die "Python could not unzip the file (is the zip complete?)"
+    else
+        die "neither unzip nor Python ('$PYTHON') is available to open the zip. Unzip it elsewhere and point SOURCE_CSV_PATH at the folder."
+    fi
+}
+
+csv_discover() { # fills CSV_ALL with lines  table|from|to|path  for every data file under CSV_DIR
+    local f info bad=0
+    CSV_ALL=""
+    while IFS= read -r -d '' f; do
+        [ "$(basename "$f")" != _manifest.csv ] || continue
+        if [[ "$f" == *'|'* ]] || ! info="$(csv_parse_name "$f")" || ! [[ "${info%%|*}" =~ $re_ident ]]; then
+            echo "ERROR: the file does not follow the pattern <TABLE>_<YYYY-MM-DD_HH_MM_SS>__to__<YYYY-MM-DD_HH_MM_SS>.csv[.gz]: $f" >&2
+            bad=$((bad+1)); continue
+        fi
+        CSV_ALL+="$info|$f"$'\n'
+    done < <(find "$CSV_DIR" -type f \( -name '*.csv' -o -name '*.csv.gz' \) -print0 | LC_ALL=C sort -z)
+    [ "$bad" -eq 0 ] || return 1
+}
+
+csv_pick() { # table -> its "from|to|path" lines that overlap the period
+    printf '%s' "$CSV_ALL" | awk -F'|' -v t="$1" -v wf="$FROM_TS" -v wt="$TO_TS" '$1==t && $2<wt && $3>wf {print $2 "|" $3 "|" $4}' | LC_ALL=C sort
+}
+
+csv_check_manifest() { # rows in _manifest.csv against the rows really in each file (one DuckDB run for all files)
+    [ "${CSV_CHECK_MANIFEST:-yes}" = yes ] || return 0
+    local i st f dir base want n=0 sql line idx rows
+    local -a MF MW
+    sql="$(duck_head)"$'\n'
+    for i in "${!SRC_T[@]}"; do
+        st="${SRC_T[$i]}"
+        while IFS= read -r f; do
+            [ -n "$f" ] || continue
+            dir="$(dirname "$f")"; base="$(basename "$f")"
+            if [ ! -f "$dir/_manifest.csv" ]; then csv_problem "$st: no _manifest.csv next to $base (the row counts cannot be checked)"; continue; fi
+            want="$(awk -F, -v b="$base" '$1==b {print $2; exit}' "$dir/_manifest.csv" | tr -d '\r')"
+            if ! [[ "$want" =~ ^[0-9]+$ ]]; then csv_problem "$st: $base is not listed in $dir/_manifest.csv"; continue; fi
+            MF[$n]="$st|$base"; MW[$n]="$want"
+            sql+="SELECT 'MCNT,$n,' || count(*) FROM read_csv('$(sqlq "$f")', header=true, all_varchar=true);"$'\n'
+            n=$((n+1))
+        done <<<"$(cut -d'|' -f3- <<<"$(csv_pick "$st")")"
+    done
+    [ "$n" -gt 0 ] || return 0
+    log "checking the row counts of $n file(s) against their _manifest.csv"
+    line="$(duck_run "$sql")" || die "DuckDB could not read the CSV files (see the error above). Nothing was changed."
+    while IFS=, read -r idx f rows; do
+        [ "$idx" = MCNT ] || continue
+        n="$f"; [ -n "${MW[$n]:-}" ] || continue
+        [ "$rows" = "${MW[$n]}" ] || csv_problem "${MF[$n]%%|*}: ${MF[$n]#*|} has $rows rows but its manifest says ${MW[$n]} (an incomplete or damaged file)"
+    done <<<"$line"
+}
+
+csv_error_files() { # the download's own error lists (___All_Errors.txt, *_Error.txt): only shown. A missing file or table is
+    # caught by the "period covered" check and by the manifest check, so this is not counted as a problem on its own.
+    local ef line shown
+    while IFS= read -r -d '' ef; do
+        warn "the download reported problems ($ef): check that none of them is a table or period you need"
+        shown=0
+        while IFS= read -r line; do
+            line="$(tr -d '
+' <<<"$line")"; [ -n "$line" ] || continue
+            if [ "$shown" -lt 12 ]; then echo "    $line" >&2; shown=$((shown+1)); fi
+        done <"$ef"
+    done < <(find "$CSV_DIR" -type f \( -name '___All_Errors.txt' -o -name '*_Error.txt' \) -print0)
+}
+
+csv_setup() { # unzip if needed, find the files, choose the tables, check that the period is complete
+    local LC_ALL=C i st line f n lo hi fr to
+    [ -n "${SOURCE_CSV_PATH:-}" ] || die "SOURCE_CSV_PATH is not set"
+    if [ -d "$SOURCE_CSV_PATH" ]; then
+        CSV_DIR="${SOURCE_CSV_PATH%/}"
+    elif [ -f "$SOURCE_CSV_PATH" ]; then
+        case "$SOURCE_CSV_PATH" in *.zip|*.ZIP) csv_extract ;; *) die "SOURCE_CSV_PATH must be a .zip file or a folder: $SOURCE_CSV_PATH" ;; esac
+    else
+        die "SOURCE_CSV_PATH not found: $SOURCE_CSV_PATH"
+    fi
+    csv_discover || die "some files in $CSV_DIR do not look like the downloaded data (see above). Nothing was changed."
+    [ -n "$CSV_ALL" ] || die "no .csv / .csv.gz data files found in $CSV_DIR"
+    if [ "$CSV_AUTO" = yes ]; then
+        SRC_T=(); TGT_T=()
+        while IFS= read -r st; do [ -n "$st" ] && { SRC_T+=("$st"); TGT_T+=("$st"); }; done \
+            < <(printf '%s' "$CSV_ALL" | awk -F'|' -v wf="$FROM_TS" -v wt="$TO_TS" '$2<wt && $3>wf {print $1}' | LC_ALL=C sort -u)
+        [ "${#SRC_T[@]}" -gt 0 ] || die "TABLES=auto, but no data file covers the period (files found: $(printf '%s' "$CSV_ALL" | wc -l))"
+    fi
+    csv_error_files
+    local -a KEEP_S=() KEEP_T=()
+    for i in "${!SRC_T[@]}"; do          # pass 1: which tables have files in this period
+        st="${SRC_T[$i]}"
+        CSV_FILES[$st]="$(csv_pick "$st" | cut -d'|' -f3)"
+        if [ -z "${CSV_FILES[$st]}" ]; then
+            [ -n "${DBI_ZIP:-}" ] || csv_problem "$st: no CSV file in $CSV_DIR covers the period"      # (a table that is in another zip of the folder is just not in this one)
+            continue
+        fi
+        KEEP_S+=("$st"); KEEP_T+=("${TGT_T[$i]}")
+    done
+    [ "$CSV_PROBLEMS" -eq 0 ] || die "the CSV files do not cover the period (see above). Nothing was changed. If you know this is fine, set CSV_INCOMPLETE=\"warn\"."
+    SRC_T=(${KEEP_S[@]+"${KEEP_S[@]}"}); TGT_T=(${KEEP_T[@]+"${KEEP_T[@]}"})
+    if [ "${#SRC_T[@]}" -eq 0 ]; then
+        [ -n "${DBI_ZIP:-}" ] || die "no table is left to import"
+        log "nothing in this zip belongs to TABLES or to the period: skipped"
+        exit 0
+    fi
+    TBL_FROM=(); TBL_TO=()
+    for i in "${!SRC_T[@]}"; do          # pass 2: the period of each table, and the check that its files have no gap
+        st="${SRC_T[$i]}"
+        lo="$(csv_pick "$st" | sed -n '1p' | cut -d'|' -f1)"
+        hi="$(csv_pick "$st" | cut -d'|' -f2 | sort | tail -1)"
+        fr="$FROM_TS"; to="$TO_TS"
+        if [ "$PERIOD_AUTO_FROM" = yes ]; then fr="$lo"; fi
+        if [ "$PERIOD_AUTO_TO" = yes ]; then to="$hi"; fi
+        if [ -n "${DBI_ZIP:-}" ]; then   # one zip of a folder of zips: only its own part of the period (the zips together were checked before)
+            if [[ "$lo" > "$fr" ]]; then fr="$lo"; fi
+            if [[ "$hi" < "$to" ]]; then to="$hi"; fi
+        fi
+        TBL_FROM[$i]="$fr"; TBL_TO[$i]="$to"
+        while IFS= read -r line; do
+            [ -n "$line" ] && csv_problem "$st: $line"
+        done < <(csv_pick "$st" | cut -d'|' -f1,2 | csv_gaps "$fr" "$to")
+        n="$(printf '%s\n' "${CSV_FILES[$st]}" | grep -c .)"
+        log "    $st: $n file(s), period $fr to $to"
+    done
+    [ "$CSV_PROBLEMS" -eq 0 ] || die "the CSV files do not cover the period (see above). Nothing was changed. If you know this is fine, set CSV_INCOMPLETE=\"warn\"."
+    csv_check_manifest
+    [ "$CSV_PROBLEMS" -eq 0 ] || die "the CSV files look incomplete or damaged (see above). Nothing was changed. If you know this is fine, set CSV_INCOMPLETE=\"warn\"."
+}
+
+csv_cleanup() { # unzipped files are removed at the end unless CSV_KEEP_EXTRACTED=yes (a folder you gave is never touched)
+    [ "${CSV_EXTRACTED:-no}" = yes ] && [ "${CSV_KEEP_EXTRACTED:-no}" = no ] && [ -n "${CSV_DIR:-}" ] || return 0
+    rm -rf "${CSV_DIR:?}"
+    return 0
+}
+
+# ---------------------------------------------------------------------------------------------
+# SOURCE_CSV_PATH is a FOLDER THAT HOLDS .zip FILES (any number): they are imported one after the other, in name
+# order, each as its own full run (unzip, checks, import, remove the unzipped files, next zip). It stops at the first
+# failure. Before anything is imported, the zips are listed (no unzipping) and the run is refused when the same table
+# and time range is in more than one zip, or when the zips together leave a gap in the period.
+# ---------------------------------------------------------------------------------------------
+csv_has_zips() { [ -n "$(find "$1" -maxdepth 1 -type f -iname '*.zip' -print -quit 2>/dev/null)" ]; }
+
+csv_zip_names() { # zip -> the names of the files inside, one per line (nothing is unzipped)
+    if command -v unzip >/dev/null 2>&1; then
+        unzip -Z1 "$1"
+    elif command -v "$PYTHON" >/dev/null 2>&1; then
+        "$PYTHON" -c 'import sys, zipfile; print("\n".join(zipfile.ZipFile(sys.argv[1]).namelist()))' "$1"
+    else
+        die "neither unzip nor Python ('$PYTHON') is available to look into $1"
+    fi
+}
+
+csv_prescan() { # zip... : refuse what would go wrong across the zips, before anything is imported
+    local LC_ALL=C z e info st wf wt lo hi line
+    local -a tables=()
+    CSV_ALL=""
+    for z in "$@"; do
+        while IFS= read -r e; do
+            [ -n "$e" ] || continue
+            [ "$(basename "$e")" != _manifest.csv ] || continue
+            info="$(csv_parse_name "$e")" || continue
+            CSV_ALL+="$info|$z"$'\n'
+        done < <(csv_zip_names "$z")
+    done
+    [ -n "$CSV_ALL" ] || die "no downloaded data files (<TABLE>_<from>__to__<to>.csv[.gz]) found in the zip files of $SOURCE_CSV_PATH"
+    if [ "$CSV_AUTO" = yes ]; then
+        while IFS= read -r st; do [ -n "$st" ] && tables+=("$st"); done \
+            < <(printf '%s' "$CSV_ALL" | awk -F'|' -v wf="$FROM_TS" -v wt="$TO_TS" '$2<wt && $3>wf {print $1}' | sort -u)
+    else
+        tables=("${SRC_T[@]}")
+    fi
+    [ "${#tables[@]}" -gt 0 ] || die "none of the zip files holds a table for the period"
+    for st in "${tables[@]}"; do
+        if [ -z "$(csv_pick "$st")" ]; then csv_problem "$st: it is in none of the zip files for this period"; continue; fi
+        lo="$(csv_pick "$st" | sed -n '1p' | cut -d'|' -f1)"
+        hi="$(csv_pick "$st" | cut -d'|' -f2 | sort | tail -1)"
+        wf="$FROM_TS"; wt="$TO_TS"
+        if [ "$PERIOD_AUTO_FROM" = yes ]; then wf="$lo"; fi
+        if [ "$PERIOD_AUTO_TO" = yes ]; then wt="$hi"; fi
+        while IFS= read -r line; do
+            [ -n "$line" ] && csv_problem "$st: $line (looking at all the zip files together)"
+        done < <(csv_pick "$st" | cut -d'|' -f1,2 | csv_gaps "$wf" "$wt")
+    done
+    [ "$CSV_PROBLEMS" -eq 0 ] || die "the zip files do not fit together (see above). Nothing was changed. If you know this is fine, set CSV_INCOMPLETE=\"warn\"."
+    log "the zip files fit together: no table and time range is in two zips, and there is no gap"
+}
+
+csv_child() { # runs this script again for one zip
+    if [ -n "${CSV_CHILD_CMD:-}" ]; then bash "$CSV_CHILD_CMD" "$@"; else bash "$HERE/db-import.sh" "$@"; fi
+}
+
+csv_multi_zip() {
+    local dir="${SOURCE_CSV_PATH%/}" z n=0 total rc=0 failed="" sfx
+    local -a ZIPS=() RES=()
+    while IFS= read -r -d '' z; do ZIPS+=("$z"); done < <(find "$dir" -maxdepth 1 -type f -iname '*.zip' -print0 | LC_ALL=C sort -z)
+    total="${#ZIPS[@]}"
+    log "db-import job '$JOB_NAME': $SOURCE_CSV_PATH holds $total zip file(s); they are imported one after the other, in name order:"
+    for z in "${ZIPS[@]}"; do echo "    $(basename "$z")"; done
+    csv_prescan "${ZIPS[@]}"
+    for z in "${ZIPS[@]}"; do
+        n=$((n+1))
+        echo; log "===== zip $n of $total: $(basename "$z") ====="
+        sfx="_$(printf '%02d' "$n")_$(basename "$z" | sed -e 's/\.[Zz][Ii][Pp]$//' -e 's/[^A-Za-z0-9_]/_/g')"
+        rc=0
+        DBI_ZIP="$z" DBI_JOB_SUFFIX="$sfx" csv_child "${ORIG_ARGS[@]}" || rc=$?
+        if [ "$rc" -ne 0 ]; then RES+=("$(basename "$z"): FAILED (exit code $rc)"); failed="$n"; break; fi
+        RES+=("$(basename "$z"): OK")
+        if [ "$n" -lt "$total" ]; then sleep "${DBI_ZIP_PAUSE:-1}"; fi     # so every zip gets its own run time stamp (and its own backup table names)
+    done
+    echo; log "the zip files:"
+    printf '    %s\n' "${RES[@]}"
+    if [ -n "$failed" ]; then
+        log "stopped at zip $failed of $total: the zips after it were NOT processed. The ones before it stay loaded."
+        return "$rc"
+    fi
+    log "all $total zip files done"
+}
+
+period_text() { # the period for the log: "auto" ends are shown as the start / end of the files
+    local f="$FROM_TS" t="$TO_TS"
+    if [ "${PERIOD_AUTO_FROM:-no}" = yes ]; then f="(start of the files)"; fi
+    if [ "${PERIOD_AUTO_TO:-no}" = yes ]; then t="(end of the files)"; fi
+    printf '%s  <=  %s  <  %s' "$f" "$TIME_COLUMN" "$t"
+}
+
+# ---------------------------------------------------------------------------------------------
+# TARGET_STRUCTURE="create" (csv source only): the target follows the data. A schema that does not exist is
+# created, a table that does not exist is created from the CSV columns, columns the CSV has and the table lacks
+# are added; nothing is ever dropped. The types of new tables / columns come from CSV_COLUMN_TYPES.
+# The statements run inside the same transaction as the data (so --dry-run rolls them back), after the backup.
+# ---------------------------------------------------------------------------------------------
+# the types of the real *_ERS_P pivot tables (checked on dev, gsb_data_kpi_pivot.KPI_NS_QRLY_CELL_5G_ERS_P and NODE_EPNGU)
+CSV_TYPES_DEFAULT='PERIOD_START_TIME=TIMESTAMP; UPDATE_TIMESTAMP=TIMESTAMP; SITE_ID=INTEGER; CELL_ID=INTEGER; LAC=DECIMAL(4,2); SAC=DECIMAL(4,2); TAC=DECIMAL(10,2); K_*=DECIMAL(30,10); *=VARCHAR'
+declare -a CSV_TP_PAT CSV_TP_VAL NEW_TBL ADD_COLS STRUCT_NOTE
+NEW_SCHEMA=no
+
+# "PATTERN=TYPE; PATTERN=TYPE; ..."  ->  CSV_TP_PAT / CSV_TP_VAL, in order (the first pattern that matches a column wins)
+csv_parse_types() {
+    local r e pat ty
+    CSV_TP_PAT=(); CSV_TP_VAL=()
+    IFS=';' read -ra r <<<"$1"
+    for e in "${r[@]}"; do
+        e="$(printf '%s' "$e" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+        [ -n "$e" ] || continue
+        if [[ "$e" != *=* ]]; then echo "ERROR: CSV_COLUMN_TYPES entry '$e' must look like COLUMN=TYPE" >&2; return 1; fi
+        pat="${e%%=*}"; ty="${e#*=}"
+        if ! [[ "$pat" =~ ^[A-Za-z0-9_*]+$ ]]; then echo "ERROR: CSV_COLUMN_TYPES column pattern '$pat' may only hold letters, digits, _ and *" >&2; return 1; fi
+        if ! [[ "$ty" =~ ^[A-Za-z]+(\([0-9]+(,[0-9]+)?\))?(\ WITH\ TIME\ ZONE)?$ ]]; then echo "ERROR: CSV_COLUMN_TYPES type '$ty' is not a plain SQL type (examples: VARCHAR, INTEGER, DECIMAL(30,10), TIMESTAMP)" >&2; return 1; fi
+        CSV_TP_PAT+=("$pat"); CSV_TP_VAL+=("$ty")
+    done
+    [ "${#CSV_TP_PAT[@]}" -gt 0 ] || { echo "ERROR: CSV_COLUMN_TYPES holds no rule" >&2; return 1; }
+}
+
+csv_col_type() { # column -> its SQL type (the first matching rule); fails when no rule matches
+    local i
+    for i in "${!CSV_TP_PAT[@]}"; do
+        # shellcheck disable=SC2254
+        case "$1" in ${CSV_TP_PAT[$i]}) printf '%s' "${CSV_TP_VAL[$i]}"; return 0 ;; esac
+    done
+    return 1
+}
+
+struct_probe() { # which schema / tables of the target do not exist yet: fills NEW_SCHEMA and NEW_TBL
+    local sql i out tag idx n
+    sql="$(duck_head)"$'\n'
+    sql+="SELECT 'SCH,0,' || count(*) FROM duckdb_schemas() WHERE database_name='tgt' AND schema_name='$TARGET_SCHEMA';
+"
+    for i in "${!TGT_T[@]}"; do
+        sql+="SELECT 'TBL,$i,' || count(*) FROM duckdb_tables() WHERE database_name='tgt' AND schema_name='$TARGET_SCHEMA' AND table_name='${TGT_T[$i]}';
+"
+    done
+    out="$(duck_run "$sql")" || die "DuckDB could not look up the target schema and tables (see the error above). Nothing was changed."
+    NEW_SCHEMA=no; NEW_TBL=()
+    for i in "${!TGT_T[@]}"; do NEW_TBL[$i]=no; done
+    while IFS=, read -r tag idx n; do
+        case "$tag" in
+            SCH) if [ "$n" = 0 ]; then NEW_SCHEMA=yes; fi ;;
+            TBL) if [ "$n" = 0 ]; then NEW_TBL[$idx]=yes; fi ;;
+        esac
+    done <<<"$out"
+    if [ "$NEW_SCHEMA" = yes ]; then for i in "${!TGT_T[@]}"; do NEW_TBL[$i]=yes; done; fi
+}
+
+struct_fill() { # i : new table -> all CSV columns are new;  existing table -> the columns it lacks are added (types by rule)
+    local i="$1" c ty new="${NEW_TBL[$1]:-no}" n=0
+    ADD_COLS[$i]=""; STRUCT_NOTE[$i]="-"
+    [ "$new" != yes ] || TGT_COLS[$i]=""
+    while IFS= read -r c; do
+        [ -n "$c" ] || continue
+        if [ "$new" = yes ] || ! has_col "${TGT_COLS[$i]}" "$c"; then
+            if bad_col "$c"; then die "${TGT_T[$i]}: column name '$c' has a character that is not supported"; fi
+            ty="$(csv_col_type "$c")" || die "${TGT_T[$i]}: no rule in CSV_COLUMN_TYPES for column $c (end the list with *=VARCHAR)"
+            TGT_TY["$i|$c"]="$ty"
+            TGT_COLS[$i]+="$c"$'\n'
+            n=$((n+1))
+            if [ "$new" != yes ]; then ADD_COLS[$i]+="$c"$'\n'; fi
+        fi
+    done <<<"${SRC_COLS[$i]}"
+    if [ "$new" = yes ]; then STRUCT_NOTE[$i]="new table ($n columns)"
+    elif [ "$n" -gt 0 ]; then STRUCT_NOTE[$i]="$n column(s) added"; fi
+}
+
+struct_ddl() { # i : the statements for table i (nothing when the structure already fits)
+    [ "${TARGET_STRUCTURE:-strict}" = create ] || return 0
+    local i="$1" c ty cols=""
+    if [ "${NEW_SCHEMA:-no}" = yes ]; then printf 'CREATE SCHEMA IF NOT EXISTS tgt."%s";\n' "$TARGET_SCHEMA"; fi
+    if [ "${NEW_TBL[$i]:-no}" = yes ]; then
+        while IFS= read -r c; do
+            [ -n "$c" ] || continue
+            ty="${TGT_TY["$i|$c"]:-}"; [ -n "$ty" ] || die "${TGT_T[$i]}: the type of column $c is not known"
+            cols+="${cols:+, }\"$c\" $ty"
+        done <<<"${TGT_COLS[$i]}"
+        printf 'CREATE TABLE tgt."%s"."%s" (%s);\n' "$TARGET_SCHEMA" "${TGT_T[$i]}" "$cols"
+    else
+        while IFS= read -r c; do
+            [ -n "$c" ] || continue
+            ty="${TGT_TY["$i|$c"]:-}"; [ -n "$ty" ] || die "${TGT_T[$i]}: the type of column $c is not known"
+            printf 'ALTER TABLE tgt."%s"."%s" ADD COLUMN "%s" %s;\n' "$TARGET_SCHEMA" "${TGT_T[$i]}" "$c" "$ty"
+        done <<<"${ADD_COLS[$i]:-}"
+    fi
+}
+
+structure_report() { # shown in the plan; the statements are also saved in the report folder
+    [ "${TARGET_STRUCTURE:-strict}" = create ] || return 0
+    local i ddl all=""
+    for i in "${!SRC_T[@]}"; do all+="$(struct_ddl "$i")"$'\n'; done
+    echo
+    if [ "$NEW_SCHEMA" = yes ]; then echo "TARGET_STRUCTURE=create: the schema $TARGET_SCHEMA does not exist and will be CREATED."; fi
+    local shown=0
+    for i in "${!SRC_T[@]}"; do
+        [ "${STRUCT_NOTE[$i]:--}" != "-" ] || continue
+        echo "TARGET_STRUCTURE=create: ${TGT_T[$i]}: ${STRUCT_NOTE[$i]}$([ -z "${ADD_COLS[$i]:-}" ] || echo ": $(tr '\n' ' ' <<<"${ADD_COLS[$i]}" | cut -c1-100)")"
+        shown=1
+    done
+    if [ "$shown" = 0 ] && [ "$NEW_SCHEMA" = no ]; then echo "TARGET_STRUCTURE=create: the target schema and tables already fit, nothing to create."; fi
+    if [ -n "${RUN_DIR:-}" ] && [ -n "$(tr -d '\n' <<<"$all")" ]; then
+        printf '%s' "$all" | grep . >"$RUN_DIR/structure_changes.sql" || true
+        echo "the statements are in $RUN_DIR/structure_changes.sql"
+    fi
+    return 0
+}
+
 load_config() {
     [ -f "$CONF" ] || die "config not found: $CONF"
     if grep -q $'\r' "$CONF"; then die "config has Windows line endings. Run: dos2unix $CONF"; fi
@@ -485,6 +915,9 @@ load_config() {
     : "${TIMEZONE:=UTC}"
     : "${FLIGHT_SLICE_MINUTES:=10}" "${FLIGHT_PAUSE_SECONDS:=2}" "${FLIGHT_MAX_ROWS:=100000}" "${FLIGHT_TIMEOUT_SECONDS:=120}"
     : "${EXPORT_DIR:=}" "${EXPORT_KEEP:=yes}" "${EXPORT_OVERWRITE:=no}" "${PYTHON:=python3}"
+    : "${SOURCE_CSV_PATH:=}" "${CSV_WORK_DIR:=}" "${CSV_KEEP_EXTRACTED:=no}" "${CSV_INCOMPLETE:=error}" "${CSV_CHECK_MANIFEST:=yes}"
+    : "${EXTRA_SOURCE_COLUMNS:=error}" "${TARGET_STRUCTURE:=strict}" "${CSV_COLUMN_TYPES:=$CSV_TYPES_DEFAULT}"
+    if [ -n "${DBI_ZIP:-}" ]; then SOURCE_CSV_PATH="$DBI_ZIP"; JOB_NAME="${JOB_NAME}${DBI_JOB_SUFFIX:-}"; fi    # run for one zip of a folder of zips
     : "${OFFLINE:=yes}" "${DUCKDB:=duckdb}" "${BUNDLE_DIR:=$HERE/bundle}" "${REPORT_DIR:=$HERE/reports}"
 }
 
@@ -511,6 +944,20 @@ validate_config() {
         check_re PYTHON "$PYTHON" "$re_path"
         [ -z "$EXPORT_DIR" ] || check_re EXPORT_DIR "$EXPORT_DIR" "$re_path"
     fi
+    case "$EXTRA_SOURCE_COLUMNS" in error|skip) ;; *) die "EXTRA_SOURCE_COLUMNS must be error or skip";; esac
+    case "$TARGET_STRUCTURE" in strict|create) ;; *) die "TARGET_STRUCTURE must be strict or create";; esac
+    if [ "$TARGET_STRUCTURE" = create ]; then
+        [ "$SOURCE_TYPE" = csv ] || die "TARGET_STRUCTURE=create is only supported with SOURCE_TYPE=csv (for now)"
+        [ "$EXTRA_SOURCE_COLUMNS" = error ] || die "TARGET_STRUCTURE=create adds the missing columns itself: do not combine it with EXTRA_SOURCE_COLUMNS=skip"
+    fi
+    if [ "$SOURCE_TYPE" = csv ]; then csv_parse_types "$CSV_COLUMN_TYPES" || die "CSV_COLUMN_TYPES is not valid (see above)"; fi
+    if [ "$SOURCE_TYPE" = csv ]; then
+        case "$CSV_INCOMPLETE" in error|warn) ;; *) die "CSV_INCOMPLETE must be error or warn";; esac
+        case "$CSV_CHECK_MANIFEST" in yes|no) ;; *) die "CSV_CHECK_MANIFEST must be yes or no";; esac
+        case "$CSV_KEEP_EXTRACTED" in yes|no) ;; *) die "CSV_KEEP_EXTRACTED must be yes or no";; esac
+        [ -z "$CSV_WORK_DIR" ] || check_re CSV_WORK_DIR "$CSV_WORK_DIR" "$re_path"
+        check_re PYTHON "$PYTHON" "$re_path"
+    fi
     check_re BACKUP_SCHEMA "$BACKUP_SCHEMA" "$re_ident"
     check_re TIME_COLUMN "$TIME_COLUMN" "$re_ident"
     check_re TIMEZONE "$TIMEZONE" '^[A-Za-z0-9_/+-]+$'
@@ -519,10 +966,22 @@ validate_config() {
         check_re "TABLE_TIME_COLUMNS table" "${e%%:*}" "$re_ident"; check_re "TABLE_TIME_COLUMNS column" "${e#*:}" "$re_ident"
     done
     for e in ${FULL_COPY_TABLES//,/ }; do check_re "FULL_COPY_TABLES entry" "$e" "$re_ident"; done
-    FROM_TS="$(norm_ts "$PERIOD_FROM")" || die "PERIOD_FROM '$PERIOD_FROM' is not valid. Use YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]"
-    TO_TS="$(norm_ts "$PERIOD_TO")"     || die "PERIOD_TO '$PERIOD_TO' is not valid. Use YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]"
+    PERIOD_AUTO_FROM=no; PERIOD_AUTO_TO=no
+    if [ "$(printf '%s' "$PERIOD_FROM" | tr 'A-Z' 'a-z')" = auto ]; then PERIOD_AUTO_FROM=yes; fi
+    if [ "$(printf '%s' "$PERIOD_TO" | tr 'A-Z' 'a-z')" = auto ]; then PERIOD_AUTO_TO=yes; fi
+    if [ "$SOURCE_TYPE" != csv ] && { [ "$PERIOD_AUTO_FROM" = yes ] || [ "$PERIOD_AUTO_TO" = yes ]; }; then
+        die "PERIOD_FROM / PERIOD_TO = \"auto\" is only supported with SOURCE_TYPE=csv (it means: from the first / to the last row of the files)"
+    fi
+    if [ "$PERIOD_AUTO_FROM" = yes ]; then FROM_TS="0001-01-01 00:00:00"
+    else FROM_TS="$(norm_ts "$PERIOD_FROM")" || die "PERIOD_FROM '$PERIOD_FROM' is not valid. Use YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]"; fi
+    if [ "$PERIOD_AUTO_TO" = yes ]; then TO_TS="9999-12-31 23:59:59"
+    else TO_TS="$(norm_ts "$PERIOD_TO")" || die "PERIOD_TO '$PERIOD_TO' is not valid. Use YYYY-MM-DD or YYYY-MM-DD HH:MM[:SS]"; fi
     [[ "$FROM_TS" < "$TO_TS" ]] || die "PERIOD_FROM ($FROM_TS) must be earlier than PERIOD_TO ($TO_TS)"
-    parse_tables
+    if [ "$SOURCE_TYPE" = csv ] && [ "$(printf '%s' "$TABLES" | tr -d ' \t\r\n' | tr 'A-Z' 'a-z')" = auto ]; then
+        CSV_AUTO=yes; SRC_T=(); TGT_T=()     # the tables are the ones found in the files (csv_setup)
+    else
+        parse_tables
+    fi
     if [ "$SOURCE_TYPE" = postgres ] && [ "$TARGET_TYPE" = postgres ]; then ENGINE=pg; else ENGINE=duck; fi
     if [ "${EXPORT_ONLY:-no}" = no ] && [ "$(side_fingerprint SOURCE)" = "$(side_fingerprint TARGET)" ] && [ "$SOURCE_SCHEMA" = "$TARGET_SCHEMA" ]; then
         local i; for i in "${!SRC_T[@]}"; do
@@ -550,10 +1009,15 @@ preflight_cols() {
                 sql+="SELECT 'SCOL,$i,' || column_name FROM (DESCRIBE SELECT * FROM $(tbl_expr SOURCE "${SRC_T[$i]}"));
 "
             fi
+            [ "${NEW_TBL[$i]:-no}" != yes ] || continue      # TARGET_STRUCTURE=create: this table will be created, nothing to describe
             sql+="SELECT 'TCOL,$i,' || column_name FROM (DESCRIBE SELECT * FROM $(tbl_expr TARGET "${TGT_T[$i]}"));
 "
+            if [ "$SOURCE_TYPE" = csv ]; then      # the csv text is cast to these types on insert
+                sql+="SELECT 'TTYP,$i,' || column_name || chr(9) || column_type FROM (DESCRIBE SELECT * FROM $(tbl_expr TARGET "${TGT_T[$i]}"));
+"
+            fi
         done
-        out="$(duck_run "$sql")" || die "DuckDB could not read the table columns (see the error above)"
+        out="$(duck_run "$sql")" || die "DuckDB could not read the table columns (see the error above). A target table that does not exist yet can be created with TARGET_STRUCTURE=\"create\" (csv source only)"
         for i in "${!SRC_T[@]}"; do
             [ "$SOURCE_TYPE" = flightsql ] || SRC_COLS[$i]=""
             TGT_COLS[$i]=""
@@ -562,10 +1026,12 @@ preflight_cols() {
             case "$tag" in
                 SCOL) SRC_COLS[$idx]+="$col"$'\n' ;;
                 TCOL) TGT_COLS[$idx]+="$col"$'\n' ;;
+                TTYP) TGT_TY["$idx|${col%%$'\t'*}"]="${col#*$'\t'}" ;;
             esac
         done <<<"$out"
         for i in "${!SRC_T[@]}"; do
             [ -n "${SRC_COLS[$i]}" ] || die "source table ${SRC_T[$i]} has no columns"
+            if [ "${TARGET_STRUCTURE:-strict}" = create ]; then struct_fill "$i"; fi
             [ -n "${TGT_COLS[$i]}" ] || die "target table ${TGT_T[$i]} has no columns"
         done
     fi
@@ -584,21 +1050,27 @@ decide_tables() {
             [ -n "$c" ] || continue
             if bad_col "$c"; then echo "ERROR: $st: column name '$c' has a character that is not supported" >&2; errs=$((errs+1)); fi
         done <<<"${SRC_COLS[$i]}"
-        missing=""
+        missing=""; local common=""
         while IFS= read -r c; do
             [ -n "$c" ] || continue
-            has_col "${TGT_COLS[$i]}" "$c" || missing+="$c "
+            if has_col "${TGT_COLS[$i]}" "$c"; then common+="$c"$'\n'; else missing+="$c "; fi
         done <<<"${SRC_COLS[$i]}"
-        if [ -n "$missing" ]; then
-            echo "ERROR: $st: these source columns are not in the target table: $missing" >&2; errs=$((errs+1))
+        if [ -n "$missing" ] && [ "${EXTRA_SOURCE_COLUMNS:-error}" = skip ]; then
+            csv_skip_note "$st" "$missing"
+        elif [ -n "$missing" ]; then
+            echo "ERROR: $st: these source columns are not in the target table: $missing(EXTRA_SOURCE_COLUMNS=\"skip\" would load only the columns the target has, once the owner of the data agrees)" >&2; errs=$((errs+1))
         fi
-        COMMON[$i]="${SRC_COLS[$i]}"
+        COMMON[$i]="$common"
         local in_s=no in_t=no
         has_col "${SRC_COLS[$i]}" "$tc" && in_s=yes
         has_col "${TGT_COLS[$i]}" "$tc" && in_t=yes
         if [ "$in_s" = yes ] && [ "$in_t" = yes ]; then
             MODE[$i]=window
-            WHERE[$i]="WHERE \"$tc\" >= TIMESTAMP '$FROM_TS' AND \"$tc\" < TIMESTAMP '$TO_TS'"
+            if [ "${SOURCE_TYPE:-}" = csv ]; then    # csv columns are text: compare them as local time, the same text on the target side
+                WHERE[$i]="WHERE CAST(\"$tc\" AS TIMESTAMP) >= TIMESTAMP '${TBL_FROM[$i]:-$FROM_TS}' AND CAST(\"$tc\" AS TIMESTAMP) < TIMESTAMP '${TBL_TO[$i]:-$TO_TS}'"
+            else
+                WHERE[$i]="WHERE \"$tc\" >= TIMESTAMP '${TBL_FROM[$i]:-$FROM_TS}' AND \"$tc\" < TIMESTAMP '${TBL_TO[$i]:-$TO_TS}'"
+            fi
         elif [ "$in_s" = no ] && [ "$in_t" = no ] && in_list "$st" "$FULL_COPY_TABLES"; then
             MODE[$i]=full; WHERE[$i]=""
         elif [ "$in_s" = no ] && [ "$in_t" = no ]; then
@@ -623,7 +1095,9 @@ preflight_counts() {
             local scnt
             if [ "$SOURCE_TYPE" = flightsql ]; then scnt="${SRC_CNT[$i]}"      # counted through the API by flight_probe_all
             else scnt="(SELECT count(*) FROM $(tbl_expr SOURCE "${SRC_T[$i]}") ${WHERE[$i]})"; fi
-            sql+="SELECT 'CNT,$i,' || $scnt || ',' || (SELECT count(*) FROM $(tbl_expr TARGET "${TGT_T[$i]}") ${WHERE[$i]});
+            local tcnt="(SELECT count(*) FROM $(tbl_expr TARGET "${TGT_T[$i]}") ${WHERE[$i]})"
+            [ "${NEW_TBL[$i]:-no}" != yes ] || tcnt="0"          # TARGET_STRUCTURE=create: the table does not exist yet
+            sql+="SELECT 'CNT,$i,' || $scnt || ',' || $tcnt;
 "
         done
         out="$(duck_run "$sql")" || die "DuckDB count failed (see the error above)"
@@ -663,6 +1137,7 @@ print_plan() {
         append)  echo "LOAD_MODE=append: source rows are inserted, nothing is deleted (running twice gives duplicates)." ;;
         stop)    echo "LOAD_MODE=stop: the target was empty for the period, source rows are inserted." ;;
     esac
+    structure_report
 }
 
 confirm_target() {
@@ -700,16 +1175,17 @@ run_table() { # i
 
 write_summary() {
     local f="$RUN_DIR/summary.csv" i
-    echo "table_source,table_target,mode,source_rows,target_rows_before,backup_table,backup_rows,target_rows_after,status,seconds,message" >"$f"
+    echo "table_source,table_target,mode,source_rows,target_rows_before,backup_table,backup_rows,target_rows_after,status,seconds,message,structure" >"$f"
     for i in "${!SRC_T[@]}"; do
-        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "${SRC_T[$i]}" "${TGT_T[$i]}" "${MODE[$i]}" "${SRC_CNT[$i]}" "${TGT_CNT[$i]}" \
-            "${BK_NAME[$i]:--}" "${BKROWS[$i]:--}" "${AFTER[$i]:--}" "${STATUS[$i]:-NOT RUN}" "${SECS[$i]:--}" "${MSG[$i]:-}" >>"$f"
+        printf '%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s\n' "${SRC_T[$i]}" "${TGT_T[$i]}" "${MODE[$i]}" "${SRC_CNT[$i]}" "${TGT_CNT[$i]}" \
+            "${BK_NAME[$i]:--}" "${BKROWS[$i]:--}" "${AFTER[$i]:--}" "${STATUS[$i]:-NOT RUN}" "${SECS[$i]:--}" "${MSG[$i]:-}" "${STRUCT_NOTE[$i]:--}" >>"$f"
     done
     log "summary: $f"
 }
 
 main() {
     CONF=""; DRY_RUN=no; CHECK_ONLY=no; ASSUME_YES=no; EXPORT_ONLY=no
+    ORIG_ARGS=("$@")
     local a
     for a in "$@"; do
         case "$a" in
@@ -726,13 +1202,16 @@ main() {
     [ "${BASH_VERSINFO[0]}" -ge 4 ] || die "bash 4 or newer is required"
     load_config
     validate_config
+    if [ "$SOURCE_TYPE" = csv ] && [ -z "${DBI_ZIP:-}" ] && [ -d "$SOURCE_CSV_PATH" ] && csv_has_zips "$SOURCE_CSV_PATH"; then
+        csv_multi_zip; return $?
+    fi
 
     RUN_TS="$(date +%Y%m%d_%H%M%S)"
     RUN_DIR="$REPORT_DIR/${RUN_TS}_${JOB_NAME}"
     mkdir -p "$RUN_DIR"
     exec > >(tee -a "$RUN_DIR/run.log") 2>&1
     TMP="$(mktemp -d)"; check_re "temp folder" "$TMP" "$re_path"
-    trap 'flight_cleanup; rm -rf "$TMP"' EXIT
+    trap 'flight_cleanup; csv_cleanup; rm -rf "$TMP"' EXIT
     cp "$CONF" "$RUN_DIR/config_used.env"
     if [ "$SOURCE_TYPE" = flightsql ]; then
         [ -n "$EXPORT_DIR" ] || EXPORT_DIR="$RUN_DIR/export"
@@ -748,7 +1227,7 @@ main() {
     else
         log "db-import job '$JOB_NAME'  ($SOURCE_TYPE -> $TARGET_TYPE, target env: $TARGET_ENV, engine: $ENGINE)"
     fi
-    log "period: $FROM_TS  <=  $TIME_COLUMN  <  $TO_TS   (time zone: $TIMEZONE)"
+    log "period: $(period_text)   (time zone: $TIMEZONE)"
     log "mode: LOAD_MODE=$LOAD_MODE BACKUP=$BACKUP$([ "$DRY_RUN" = yes ] && echo ', DRY-RUN (rolled back at the end)')$([ "$CHECK_ONLY" = yes ] && echo ', CHECK ONLY (no change)')"
     log "report folder: $RUN_DIR"
     if [ "$SOURCE_TYPE" = flightsql ]; then setup_flight; fi
@@ -762,6 +1241,7 @@ main() {
     fi
     [ "$BACKUP" = on ] || [ "$EXPORT_ONLY" = yes ] || warn "BACKUP=off: the rows that are replaced will NOT be saved anywhere"
 
+    [ "$SOURCE_TYPE" != csv ] || csv_setup
     [ "$SOURCE_TYPE" != flightsql ] || flight_probe_all
     if [ "$EXPORT_ONLY" = yes ]; then
         [ "$CHECK_ONLY" = no ] || { log "check only: nothing was exported"; exit 0; }
@@ -770,6 +1250,7 @@ main() {
         exit 0
     fi
 
+    if [ "$TARGET_STRUCTURE" = create ]; then struct_probe; fi
     preflight_cols
     decide_tables
     preflight_counts

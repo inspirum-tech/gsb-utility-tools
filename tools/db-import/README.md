@@ -8,6 +8,7 @@ with the other tools in this repository.
 **To run it on uat / prod follow [RUNBOOK.md](RUNBOOK.md)** (step by step, no other help needed).
 Status and decisions: [PLAN.md](PLAN.md), open items: [parking-lot.md](parking-lot.md), what was tested: [docs/EVIDENCE.md](docs/EVIDENCE.md).
 The Flight SQL source (prod API to UAT through a tunnel): [PLAN-FLIGHTSQL.md](PLAN-FLIGHTSQL.md).
+The CSV source (the zip downloaded from prod, loaded into UAT, the target can follow the data): RUNBOOK section 3.6 and [PLAN-CSV.md](PLAN-CSV.md).
 
 ## Quick start
 
@@ -39,9 +40,10 @@ match, the table is rolled back and nothing is left behind (not even the backup)
 | Postgres -> Postgres | `psql` only. The target `psql` runs the source `psql` as a program and streams the rows (csv), no file | bash 4+, psql |
 | anything with DuckDB / DuckLake / parquet | the DuckDB CLI, extensions from `bundle/` | bash 4+, `bundle/` (it holds the DuckDB binary) |
 | source `flightsql` (the gsb-kpi-data-api, read in small time slices; used when the source's data files cannot be reached, e.g. prod from UAT through a tunnel) | `flightsql_export.py` (Python) saves the slices as parquet files, then the DuckDB engine imports them | the above, plus `python3` and `bundle/pylibs` |
+| source `csv` (the zip or folder of CSV files downloaded from prod) | DuckDB reads the files (`read_csv`) and imports them; a zip is unzipped once (`unzip`, or Python as a fallback) | DuckDB, plus `unzip` or `python3` for a zip |
 
 You never choose the engine: `SOURCE_TYPE` and `TARGET_TYPE` in the config decide.
-Source types: `postgres`, `duckdb` (file), `ducklake`, `parquet`, `flightsql`. Target types: `postgres`, `duckdb`, `ducklake`.
+Source types: `postgres`, `duckdb` (file), `ducklake`, `parquet`, `flightsql`, `csv`. Target types: `postgres`, `duckdb`, `ducklake`.
 
 ## Offline (uat / prod have no internet)
 
@@ -70,7 +72,7 @@ Everything is in the config file; [config.example.env](config.example.env) docum
 |---|---|
 | `SOURCE_*`, `TARGET_*` | type, host, port, database, user, schema, and `*_PASSWORD_ENV` (the **name** of an environment variable holding the password; empty = `~/.pgpass`). Never put a password in the file |
 | `TARGET_ENV` | `dev`, `uat` or `prod`. For `prod` the script asks you to type the database name (or pass `--yes`) |
-| `TABLES` | `A,B` or `SOURCE=TARGET`. Target tables must already exist (the script never creates them) |
+| `TABLES` | `A,B` or `SOURCE=TARGET`. Target tables must already exist, except with a csv source and `TARGET_STRUCTURE="create"` (RUNBOOK 3.6), which creates the missing schema, tables and columns |
 | `PERIOD_FROM`, `PERIOD_TO` | `PERIOD_FROM <= TIME_COLUMN < PERIOD_TO`. A date alone = 00:00:00; `YYYY-MM-DD HH:MM[:SS]` also accepted; anything else is refused |
 | `TIMEZONE` | default `UTC`. The zone the period is written in and the zone used for `timestamp with time zone` columns (also when copying them into a plain `timestamp` column). The gsb pivot data is Sydney time, so use `Australia/Sydney`. Found on dev: DuckLake `PERIOD_START_TIME` is `timestamptz`, the Postgres OLD one is a plain `timestamp` |
 | `TIME_COLUMN` | default `PERIOD_START_TIME` (checked on dev for the 24 `KPI_NS_QRLY_*_ERS_P` tables). `TABLE_TIME_COLUMNS=T:COL` for a table that differs |
@@ -79,6 +81,7 @@ Everything is in the config file; [config.example.env](config.example.env) docum
 | `BACKUP` | `on` (default) or `off`. On = the replaced rows are saved in `BACKUP_SCHEMA."<table>_bak_<date_time>"` in the target database. Off = no backup, a warning is printed |
 | `ON_ERROR` | `stop` (default) or `continue` with the next table |
 | `OFFLINE` | `yes` (default) or `no` |
+| `SOURCE_CSV_PATH`, `CSV_*`, `TARGET_STRUCTURE`, `EXTRA_SOURCE_COLUMNS` | `SOURCE_TYPE="csv"`: the downloaded zip, a folder of zips (imported one after the other in name order), or a folder; `PERIOD_FROM` / `PERIOD_TO` can be `"auto"` (every row of the files); the checks on it, and whether the target schema, tables and columns are created to follow the data (`TARGET_STRUCTURE="create"`; default `strict`). See RUNBOOK section 3.6 |
 | `FLIGHT_*`, `EXPORT_*`, `PYTHON` | only for `SOURCE_TYPE="flightsql"`: row cap, slice size, pause, where the exported files go and whether they are kept. See RUNBOOK section 3.5 |
 
 ## Safety checks (before anything is written)

@@ -27,6 +27,7 @@ You run it in three steps, always in this order:
 | Postgres -> Postgres | `bash` 4 or newer and `psql`. Nothing else |
 | anything with DuckDB, DuckLake or parquet | `bash` 4 or newer and the `bundle/` folder (it contains the DuckDB program and its extensions) |
 | a source read through the Flight SQL API (`flightsql`, section 3.5) | the same, plus `python3`, and the Python packages in `bundle/pylibs` (built with `./prepare-bundle.sh --with-flightsql`) |
+| a zip downloaded from prod (`csv`, section 3.6) | the same as for DuckDB / DuckLake (the `bundle/`), plus `unzip` or `python3` to open a zip, and free disk space of about the zip's size. No connection to prod |
 
 Check: `bash --version | head -1` and `psql --version`. No internet is needed, ever.
 The machine must be able to reach both databases (host and port). It can be a machine other than the database servers.
@@ -53,7 +54,7 @@ If the user cannot create the backup tables, ask your DBA for the right, or set 
    grep -c $'\r' db-import.sh        # must print 0
    bash -n db-import.sh && echo SYNTAX_OK
    ```
-3. Optional self-test of the logic (no database needed): `bash tests/test_functions.sh | tail -1` prints `passed: 61   failed: 0`.
+3. Optional self-test of the logic (no database needed): `bash tests/test_functions.sh | tail -1` prints `passed: <N>   failed: 0` (N is the number of checks, about 230; `failed` must be 0).
 4. **If DuckDB / DuckLake / parquet is involved:** the `bundle/` folder must be inside the `db-import` folder.
    It is built once on **dev** (the only machine with internet) by someone with dev access: `./prepare-bundle.sh --tar`, which writes
    `db-import-bundle-<version>-<date>.tar.gz` and a `.sha256`. Copy both to the server, then:
@@ -86,7 +87,7 @@ Fill in the sections below. Rules for the file: plain `NAME="value"` lines, no s
 
 | Setting | Meaning |
 |---|---|
-| `SOURCE_TYPE` / `TARGET_TYPE` | `postgres`, `duckdb` (a .duckdb file), `ducklake`; a source can also be `parquet` or `flightsql` (the source environment's API, section 3.5) |
+| `SOURCE_TYPE` / `TARGET_TYPE` | `postgres`, `duckdb` (a .duckdb file), `ducklake`; a source can also be `parquet`, `flightsql` (the source environment's API, section 3.5) or `csv` (a zip downloaded from prod, section 3.6) |
 | `TARGET_ENV` | `dev`, `uat` or `prod`. **Set it to the real environment of the target.** With `prod` the tool asks you to type the database name before it writes |
 | `*_HOST`, `*_PORT`, `*_DB`, `*_USER` | the Postgres connection. For `ducklake` these are the connection of the Postgres database that holds the DuckLake metadata (database `ducklake`) |
 | `*_SCHEMA` | the schema of the tables (Postgres schema, or `main` for a .duckdb file, or the DuckLake schema) |
@@ -94,6 +95,7 @@ Fill in the sections below. Rules for the file: plain `NAME="value"` lines, no s
 | `SOURCE_DB_FILE` / `TARGET_DB_FILE` | path of the .duckdb file (type `duckdb`) |
 | `*_DUCKLAKE_DATA_PATH`, `*_DUCKLAKE_METADATA_SCHEMA` | DuckLake only: the data folder (`/mnt/mfs/gsb_data/duckdb/ducklake` on dev) and the metadata schema (`metadata`) |
 | `SOURCE_PARQUET_GLOB` | parquet only, e.g. `/data/export/{TABLE}/*.parquet` (`{TABLE}` is replaced by the table name) |
+| `SOURCE_CSV_PATH` | csv only: the zip, the unzipped folder, or a folder of zips (section 3.6). A csv source has no host, schema or password: only the `TARGET_*` settings are needed |
 
 Notes:
 - **Always give a real `*_HOST` when DuckDB / DuckLake is involved.** An empty host (local socket) was tested only for Postgres -> Postgres; the DuckDB paths were tested over the network (host and port) only.
@@ -112,8 +114,8 @@ If the source data folder exists only on another server, use one of these (confi
 |---|---|
 | A | Make the source data folder visible on the machine that runs the tool, read-only, **at the same path** (a mount; ask the infrastructure team). Then DuckLake to DuckLake runs as one import |
 | B | Two steps with a DuckDB file in between. Step 1, on the source side: DuckLake -> `duckdb` file (`TARGET_TYPE="duckdb"`, `TARGET_DB_FILE=...`). Step 2: copy the file to the target side. Step 3, on the target side: `duckdb` file -> DuckLake. Each step is a tested combination; the chain with a real prod and UAT was not run |
-
 | C | **When the networks are separated (UAT cannot reach prod): read the source through its Flight SQL API** (`SOURCE_TYPE="flightsql"`, section 3.5). Only a tunnel to the API port is needed; no data folder, no metadata Postgres of the source. Tested on dev against the dev API |
+| D | **When the data is downloaded from prod as a zip and copied to UAT: load the zip** (`SOURCE_TYPE="csv"`, section 3.6). No connection to prod at all. Tested on dev |
 
 Tested on dev: DuckLake to DuckLake inside one catalog (two different schemas, one DuckDB session with both attached). Two separate catalogs (prod and UAT) were not tested.
 
@@ -122,7 +124,7 @@ Tested on dev: DuckLake to DuckLake inside one catalog (two different schemas, o
 | Setting | Meaning | Example |
 |---|---|---|
 | `TABLES` | comma separated, new lines allowed. `A=B` means source table A goes into target table B | `TABLES="KPI_NS_QRLY_CELL_LTE_ERS_P,KPI_NS_QRLY_NODE_CEM_ERS_P"` |
-| `PERIOD_FROM`, `PERIOD_TO` | the period: `PERIOD_FROM <= time column < PERIOD_TO`. `PERIOD_TO` itself is **not** included | see below |
+| `PERIOD_FROM`, `PERIOD_TO` | the period: `PERIOD_FROM <= time column < PERIOD_TO`. `PERIOD_TO` itself is **not** included. With a csv source both can be `"auto"`: every row of the files (section 3.6) | see below |
 | `TIME_COLUMN` | the time column (default `PERIOD_START_TIME`) | |
 | `TIMEZONE` | the time zone the period is written in. **Use `Australia/Sydney` for the gsb data** | `TIMEZONE="Australia/Sydney"` |
 
@@ -139,7 +141,7 @@ Why `TIMEZONE` matters: some tables store the time with a time zone (the DuckLak
 `TIMEZONE` makes the period and the copied values mean the same thing in both. Without the right zone the values can shift by 11 hours.
 
 The tool needs the same column names on both sides: every column of the source table must exist in the target table (the target may have extra columns, which get their default).
-The target table must already exist. The tool never creates tables.
+The target table must already exist. Only with a csv source and `TARGET_STRUCTURE="create"` (section 3.6) does the tool create the missing schema, tables and columns itself.
 
 ### 3.4 How it behaves
 
@@ -206,6 +208,79 @@ There is no `SOURCE_PASSWORD_ENV` for this source (the API has no login). The ti
 - Only a time column of type timestamp is supported. Another type, or a table without the column, stops the run with a message.
 - The row cap: pick `FLIGHT_SLICE_MINUTES` so that one slice is far below `FLIGHT_MAX_ROWS`. If it still fails, lower it. The data of one single time stamp cannot be split further.
 
+### 3.6 Loading the downloaded CSV files (`SOURCE_TYPE="csv"`)
+
+**When to use it.** The data was downloaded from prod as a zip (nothing connects UAT to prod). A teammate puts the zip on this server and the tool loads it, instead of inserting the CSV files by hand. There is no connection to prod at all: no tunnel, no API.
+**Upload the zip as ONE file** (bulk is much quicker than many small files). An already unzipped folder works too.
+
+**What the zip looks like** (the NSTD download): one folder per table, one `.csv.gz` file per time range, and a `_manifest.csv` (`file,rows`) in each folder:
+
+```
+export_nonstd.zip
+  export_nonstd/NODE_EPNGU/KPI_NS_QRLY_NODE_EPNGU_ERS_P_2026-10-25_00_00_00__to__2026-10-25_01_00_00.csv.gz
+  export_nonstd/NODE_EPNGU/..._01_00_00__to__..._02_00_00.csv.gz
+  export_nonstd/NODE_EPNGU/_manifest.csv
+  export_nonstd/___All_Errors.txt        <- what the download could not fetch (only shown by the tool)
+```
+
+The **table name is read from the file name** (`KPI_NS_QRLY_NODE_EPNGU_ERS_P`), not from the folder, so any family of tables works. Files that do not follow this name pattern stop the run.
+
+**Settings** (the target side is as in any other job)
+
+| Setting | Meaning | Default |
+|---|---|---|
+| `SOURCE_TYPE="csv"` | read the downloaded files | |
+| `SOURCE_CSV_PATH` | the `.zip` file, the folder with the unzipped files, or **a folder that holds several `.zip` files** (see "Several zips in one folder" below) | |
+| `TABLES` | `"auto"` = every table found in the files for the period, or a list as usual (`SOURCE_NAME=TARGET_NAME` when the target is named differently) | |
+| `PERIOD_FROM`, `PERIOD_TO` | a date or time as for every job, or **`"auto"`**: from the first / to the last row of each table's files. With both `"auto"` the whole content of the zip is loaded, and only the target rows of that same range are replaced (each table uses its own range). A fixed date loads only that part of the files | |
+| `TIMEZONE` | `"Australia/Sydney"`: the times in the files are Sydney local time | `UTC` |
+| `TARGET_*` | the DuckLake target (see example E). `TARGET_SCHEMA` can be an existing schema or a new one (see `TARGET_STRUCTURE`) | |
+| `TARGET_STRUCTURE` | `strict`: the schema, tables and columns must already fit, otherwise the run stops. `create`: the data is the truth, the target follows it (see below) | `strict` |
+| `CSV_COLUMN_TYPES` | types for NEW tables and columns: `COLUMN=TYPE; ...`, first matching rule wins, `*` matches any characters | the types of the real `_ERS_P` pivot tables |
+| `EXTRA_SOURCE_COLUMNS` | with `strict`: the data has columns the table lacks: `error` stops and lists them, `skip` loads only the columns the table has (listed in `skipped_columns.txt`). Not allowed together with `create` | `error` |
+| `CSV_WORK_DIR` | where a zip is unzipped. **The root disk of a server can be small:** the zip needs about its own size free here | the run's temp folder (`/tmp`) |
+| `CSV_KEEP_EXTRACTED` | `yes` keeps the unzipped files after the run (a folder you gave is never removed) | `no` |
+| `CSV_CHECK_MANIFEST` | compare the rows of each file with its `_manifest.csv` (reads every file once more) | `yes` |
+| `CSV_INCOMPLETE` | `error` stops when the period is not fully covered or a count differs; `warn` only warns | `error` |
+
+**Checks before anything is written** (all printed by `--check`)
+1. Every table has files that cover the whole period with no gap and no overlap (`no file for 2026-10-25 03:15:00 to 2026-10-25 04:00:00` names a missing time).
+2. The rows of each file equal its `_manifest.csv` line (a damaged or partly copied file is caught here).
+3. The download's own error list (`___All_Errors.txt`) is printed, so you can see what was not downloaded.
+4. The usual checks: the time column, the target, the row counts and the backup.
+
+**`TARGET_STRUCTURE="create"`: the prod data is the source of truth.** After the import the target holds exactly the columns and rows of the files:
+
+| Situation | What the tool does |
+|---|---|
+| schema and table exist, same columns | loads, as always |
+| the table lacks columns the files have | **adds the columns**, then loads all of them (CSV has `A, B, C, D`, the table `A, B, C`: `D` is added) |
+| the table has columns the files lack | leaves them (empty values); nothing is ever dropped |
+| the table does not exist | **creates the table** from the file's columns |
+| the schema does not exist | **creates the schema**, then the tables |
+
+- `--check` prints every change (`TARGET_STRUCTURE=create: ... new table (8 columns)` or `1 column(s) added: K_-68`) and saves the exact statements in `<report folder>/structure_changes.sql`. `summary.csv` has a `structure` column.
+- The statements run in the **same transaction as the data, after the backup**: `--dry-run` rolls them back too (proven on DuckLake), and the backup of the old rows is taken before any column is added.
+- **A created table or an added column stays after a real run.** The backup holds the old rows, not the old structure. That is why the default is `strict`: set `create` on purpose, and always run `--check` first (a typo in `TARGET_SCHEMA` would otherwise create a new schema).
+- Types of new tables and columns: `PERIOD_START_TIME` and `UPDATE_TIMESTAMP` timestamp, `SITE_ID` and `CELL_ID` integer, `LAC` and `SAC` `DECIMAL(4,2)`, `TAC` `DECIMAL(10,2)`, `K_*` `DECIMAL(30,10)`, everything else text: the types of the real `_ERS_P` tables. Existing columns keep their own type. A value that does not fit a type makes the run fail and roll back, never lose data silently.
+- Only with `SOURCE_TYPE="csv"` for now.
+
+**Several zips in one folder.** Set `SOURCE_CSV_PATH` to a **folder that holds `.zip` files** (any number: 2, 5, 8 ...). The logic is the same for every count:
+1. The zips are taken in **name order**. To choose the order, name them `01_nstd.zip`, `02_other.zip`, and so on.
+2. Before anything is imported, the tool looks into every zip (it unzips nothing) and **refuses the run** when the same table and time range is in more than one zip (the second zip would overwrite the first), or when the zips together leave a gap. The same table in two zips with different time ranges is fine.
+3. Then one zip after the other is run as a **full job of its own**: unzip, checks, import, remove the unzipped files, next zip. The report folders are named `<time>_<job>_01_<zip name>`, `..._02_...`. Only one zip is unzipped at a time, so the disk needs the size of the biggest zip, not of all of them.
+4. It **stops at the first failure**. The zips before it stay loaded, the zips after it are not touched. The last lines list every zip and its result.
+- `TABLES` can list tables from different zips: each zip loads only the tables that are in it. A table that is in none of the zips stops the run before anything is imported.
+- `--check` and `--dry-run` also go through all the zips (one after the other), so check the whole folder before the real run.
+- A fixed period can span several zips: each zip loads only its own part of the period, and the check that the zips together cover the whole period is done first.
+- Put only the zips you want in the folder: every `.zip` in it is imported.
+
+**Good to know**
+- Every column is read as text and cast to the target type on insert, so `DECIMAL(30,10)` counters keep every digit.
+- The times are loaded as written (Sydney local time). A plain `timestamp` target keeps them as written; a `timestamptz` target uses `TIMEZONE`. The hour that happens twice when the clocks go back (April) cannot be told apart in plain text: check that hour by hand on a `timestamptz` target.
+- Re-running the same job is safe: `replace` backs up and replaces the rows of the period.
+- Run it in the usual order: `--check`, `--dry-run`, then the real run.
+
 ## 4. Passwords
 
 Passwords are never written in the config. Two ways:
@@ -221,7 +296,7 @@ The variable must be set in the **same terminal** where you run the tool; it is 
 **B. `~/.pgpass`** of the user who runs the tool (a line `host:port:database:user:password`, `chmod 600`). Leave `*_PASSWORD_ENV=""`.
 
 The plain `PGPASSWORD` variable is ignored on purpose, so that two databases never share one password by mistake.
-A `flightsql` source has no password (the API has no login): only the target password is needed.
+A `flightsql` or `csv` source has no password (the API has no login; a zip has none): only the target password is needed.
 
 ## 5. Run
 
@@ -262,7 +337,9 @@ Each run writes a folder `reports/<date_time>_<job>/` with:
 | File | Contents |
 |---|---|
 | `run.log` | everything that was printed |
-| `summary.csv` | per table: rows in the source, rows in the target before and after, the backup table and its rows, status, seconds |
+| `summary.csv` | per table: rows in the source, rows in the target before and after, the backup table and its rows, status, seconds, and (csv) what was created or added in the target |
+| `structure_changes.sql` | only with `TARGET_STRUCTURE="create"`: the exact `CREATE SCHEMA` / `CREATE TABLE` / `ALTER TABLE ... ADD COLUMN` statements of the run (also written by `--check`) |
+| `skipped_columns.txt` | only with `EXTRA_SOURCE_COLUMNS="skip"`: the columns that were not loaded |
 | `config_used.env` | a copy of the config (no secrets) |
 
 Optional proof in SQL (Postgres target). The rows of the period must equal the source:
@@ -290,6 +367,12 @@ Always edit the config file (`vi configs/<job>.env`), then run `--check` again.
 | write the reports somewhere else | `REPORT_DIR="/path/you/can/write"` |
 | run without the question on prod | add `--yes` to the command |
 | a second job | copy the config to a new name, e.g. `cp configs/prod_to_uat.env configs/prod_to_dev.env`, and edit that |
+| load a zip downloaded from prod | `SOURCE_TYPE="csv"` and `SOURCE_CSV_PATH="/path/to/file.zip"` (example E, section 3.6) |
+| load every table and every row of the zip | `TABLES="auto"`, `PERIOD_FROM="auto"`, `PERIOD_TO="auto"` (csv only) |
+| load several zips in one go | put the zips in one folder and set `SOURCE_CSV_PATH` to the folder; they run in name order (`01_...`, `02_...`) |
+| load into a schema that does not exist yet, or into tables that lack columns | `TARGET_STRUCTURE="create"` (csv only; run `--check` first: it lists what will be created) |
+| load into another schema | `TARGET_SCHEMA="<schema>"` (all zips of the run go to this one schema) |
+| the root disk is small | `CSV_WORK_DIR="/folder/with/space"` (where the zip is unzipped) |
 
 ## 7. Example configs
 
@@ -391,6 +474,32 @@ OFFLINE="yes"
 ```
 Only `TARGET_PASSWORD_ENV` needs a password. Run `--check`, then `--dry-run`, then the real run, as always.
 
+**E. A zip downloaded from prod -> UAT DuckLake** (no connection to prod at all; the zip was copied to this server)
+```bash
+JOB_NAME="uat_load_nstd_zip"
+SOURCE_TYPE="csv"
+SOURCE_CSV_PATH="/data/upload/export_nonstd.zip"   # a .zip, an unzipped folder, or a FOLDER OF ZIPS (imported in name order)
+TARGET_TYPE="ducklake"
+TARGET_ENV="uat"
+TARGET_HOST="<UAT metadata Postgres host>"
+TARGET_PORT="5432"
+TARGET_DB="ducklake"
+TARGET_USER="postgres"
+TARGET_PASSWORD_ENV="TARGET_PGPASSWORD"
+TARGET_DUCKLAKE_DATA_PATH="<UAT DuckLake data path>"
+TARGET_DUCKLAKE_METADATA_SCHEMA="metadata"
+TARGET_SCHEMA="gsb_data_kpi_pivot"     # an existing schema, or a new one (created when TARGET_STRUCTURE="create")
+TABLES="auto"                          # every table found in the zip; or a list
+PERIOD_FROM="auto"                     # every row in the files; or real dates for only a part
+PERIOD_TO="auto"
+TARGET_STRUCTURE="create"              # create missing schema / tables / columns so the target equals the data; "strict" = stop instead
+TIMEZONE="Australia/Sydney"
+CSV_WORK_DIR="/data/tmp"               # optional: a folder with enough free space for the unzipped zip (the root disk can be small)
+OFFLINE="yes"
+```
+There is no source host and no source password. Only `TARGET_PASSWORD_ENV` needs a password. Run `--check` (it prints what would be created), then `--dry-run`, then the real run.
+For several zips put them in one folder (for example `/data/upload/zips/` holding `01_nstd.zip` and `02_other.zip`) and set `SOURCE_CSV_PATH` to that folder: they are imported one after the other (section 3.6).
+
 ## 8. Undo a run
 
 Only possible if the run had `BACKUP="on"`. The saved rows are in the target database, in the table named in the run log / `summary.csv` (column `backup_table`).
@@ -408,6 +517,7 @@ DuckDB / DuckLake target: the same two statements, with the table written as `"m
 
 If the backup table was empty or not made (the target had no rows for the period), the undo is just the `DELETE`.
 Backup tables are **not** removed automatically. When you no longer need one: `DROP TABLE import_backup."<table>_bak_<date_time>";`.
+**Structure changes are not undone by the backup.** With `TARGET_STRUCTURE="create"` the backup holds the old rows, not the old structure: a created schema, a created table or an added column stays. `structure_changes.sql` in the run's report folder lists exactly what was created; remove it by hand (`DROP TABLE`, `ALTER TABLE ... DROP COLUMN`) if you need to, after checking that nothing else uses it.
 
 ## 9. If something goes wrong
 
@@ -424,7 +534,7 @@ Every message below is printed before anything is written, unless stated. Exit c
 | `source and target are the same table` | the source and target settings point to the same database and schema: correct `SOURCE_*` or `TARGET_*` |
 | `psql not found` | install or load the PostgreSQL client (`psql`) |
 | `psql: error: connection ... failed` / `password authentication failed` / `role "..." does not exist` | wrong host, port, user or password. Test by hand: `psql -h <host> -p <port> -U <user> -d <db> -c 'select 1'` |
-| `source table ... does not exist` / `target table ... does not exist` | wrong table name or schema. The tool never creates the target table: create it first (same columns as the source) |
+| `source table ... does not exist` / `target table ... does not exist` | wrong table name or schema. Create the target table first (same columns as the source), or, with a csv source, set `TARGET_STRUCTURE="create"` |
 | `these source columns are not in the target table: ...` | the target table lacks columns that the source has. Align the tables |
 | `no column PERIOD_START_TIME in source or target ...` | the table has another time column name or none: `TABLE_TIME_COLUMNS=...` or `FULL_COPY_TABLES=...` (section 6) |
 | `time column ... exists in the source: yes, in the target: no` | the time column must be on both sides |
@@ -445,6 +555,17 @@ Every message below is printed before anything is written, unless stated. Exit c
 | `slice N of M (...) returned R rows, which is the row cap` | the API may have cut the result, so the table is not imported. Lower `FLIGHT_SLICE_MINUTES`. If the cap on the API differs from `FLIGHT_MAX_ROWS`, set it to the real value |
 | `the table has no time column '...'` / `time column '...' has type ...` | set `TIME_COLUMN` or `TABLE_TIME_COLUMNS` (section 6); only timestamp columns are supported |
 | `... already holds files from an earlier export` | an earlier export is in `EXPORT_DIR`: use another folder, leave `EXPORT_DIR` empty, or set `EXPORT_OVERWRITE="yes"` (section 3.5) |
+| `no CSV file in ... covers the period` / `no file for <time> to <time>` | the downloaded files do not cover the whole period: download the missing part, or shorten the period. `CSV_INCOMPLETE="warn"` only if you know it is fine (section 3.6) |
+| `<file> has N rows but its manifest says M` | a damaged or partly copied file: copy the zip again and check its size. Nothing was written |
+| `the file does not follow the pattern <TABLE>_<YYYY-MM-DD_HH_MM_SS>__to__<...>.csv[.gz]` | the folder holds a file that is not part of the download: remove it, or point `SOURCE_CSV_PATH` at the right folder |
+| `not enough free space in ... for the zip` | set `CSV_WORK_DIR` to a folder with more free space (the root disk is often small), or unzip the file yourself and give the folder |
+| `neither unzip nor Python ... is available to open the zip` | unzip it on another machine and give the folder as `SOURCE_CSV_PATH` |
+| `... table does not exist` with `TARGET_STRUCTURE="strict"` | set `TARGET_STRUCTURE="create"` (csv source only) to create the schema and tables, after `--check` shows what will be created |
+| `TARGET_STRUCTURE=create adds the missing columns itself: do not combine it with EXTRA_SOURCE_COLUMNS=skip` | remove `EXTRA_SOURCE_COLUMNS` from the config |
+| `no rule in CSV_COLUMN_TYPES for column ...` | end the rule list with `*=VARCHAR` |
+| `PERIOD_FROM / PERIOD_TO = "auto" is only supported with SOURCE_TYPE=csv` | use real dates for the other sources |
+| `the zip files do not fit together` (folder of zips) | two zips hold the same table and time range, or leave a gap between them (the lines above name the table and the times). Remove the duplicate zip, add the missing one, or set `CSV_INCOMPLETE="warn"` if you know it is fine |
+| `stopped at zip N of M` (folder of zips) | zip N failed: read its error above. The zips before it stay loaded, the ones after it were not touched. Fix the cause and run again (a zip that already loaded is replaced with the same data) |
 
 If you cannot solve it: do not run the real step. Keep the folder `reports/<date_time>_<job>/` (it has the complete log) and send it with the config (`config_used.env` in it).
 
@@ -455,7 +576,7 @@ If you cannot solve it: do not run the real step. Keep the folder `reports/<date
 - Every table is one transaction: all or nothing. The row count is checked inside it.
 - `--check` and `--dry-run` change nothing. Always run them first.
 - A prod target needs you to type the database name.
-- It never creates, drops or alters a table (only the backup schema and the backup tables).
+- It never drops anything. It creates or alters a table or schema only with `TARGET_STRUCTURE="create"` (csv source), after `--check` listed exactly what it will do; otherwise only the backup schema and tables are created.
 - Passwords are not stored anywhere by the tool.
 
 ## 11. What was tested, and what was not
@@ -468,6 +589,12 @@ DuckLake -> DuckLake (40,921 rows, `--check`, `--dry-run`, real run, equal row f
 
 **Flight SQL source** (section 3.5), tested on dev against the dev API with real data: API -> DuckLake (40,921 rows: `--check`, `--dry-run`, real run, equal row for row, the 40,921 old rows replaced and saved in the backup), a table with a time zone and a table without one,
 the row-cap failure (nothing written), `--export-only` (no password needed), importing the kept files later with no API call, `EXPORT_KEEP="no"`, and the offline bundle with `pylibs` (empty home folder; a bundle built for another Python is refused). See `docs/EVIDENCE.md` and `PLAN-FLIGHTSQL.md` (sections 9 to 12).
+
+**CSV source** (section 3.6), tested on dev with a real cut-out of the prod NSTD download (two tables, 130,727 and 234,552 rows, `unzip` route): zip -> DuckLake with `--check`, `--dry-run`, a real run and a second run (replace with backup), equal row for row (`EXCEPT` in both directions);
+a table with a time zone and a plain `timestamp` target; `TARGET_STRUCTURE="create"` into a schema that did not exist (schema and two tables created, rolled back by `--dry-run`, then created by the real run) and adding a missing column to an existing table (also rolled back by `--dry-run`);
+a period the files do not cover (stopped before any write, exit code 2);
+`PERIOD_FROM="auto"` / `PERIOD_TO="auto"` (every row of the files, each table with its own range); a **folder of two zips** in name order (two tables, one per zip, into a new schema, 130,727 and 234,552 rows), the **same table split by time over two zips** (80,445 + 50,282 = 130,727 rows, equal row for row), and the refusal when the same table and time range is in two zips (exit code 2, nothing imported).
+Evidence: `PLAN-CSV.md` (sections 8 to 13).
 
 **Not tested:** two separate DuckLake catalogs (for example prod and UAT) read directly; a real tunnel from UAT to the prod API, the prod API itself (its version, row cap and tables may differ from dev) and UAT's Python (the bundle must be built for it); the Flight SQL source with a Postgres target.
 
@@ -484,3 +611,6 @@ UAT and prod themselves could not be tested (no access). That is why you run `--
 - [ ] `--dry-run`: every table `DRY-RUN OK`, `finished: all tables OK`
 - [ ] First real run with a **small period**, then check `summary.csv` and the rows in the target
 - [ ] Note the backup table names; drop them when no longer needed
+- [ ] CSV zip: the zip is on the server (upload it as ONE file), `unzip` or `python3` exists, there is enough free disk (`CSV_WORK_DIR` if `/tmp` is small), `--check` shows every table you expect and no `ERROR`
+- [ ] `TARGET_STRUCTURE="create"`: read what `--check` says it will create or add (a typo in `TARGET_SCHEMA` would create a new schema), and keep `structure_changes.sql`
+- [ ] Several zips in a folder: only the zips you want are in it (every `.zip` is imported), named in the order you want
