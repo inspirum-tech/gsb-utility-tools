@@ -2,7 +2,8 @@
 -- Result tables (same shape for a wide and a tall side):
 --   ${SIDE}_keys (p_utc, k, n_rows)        one row per object and period
 --   ${SIDE}_cols (kpi)                     the KPI column names
---   ${SIDE}_long (p_utc, k, kpi, val, n)   one row per object, period and KPI with a value (NULLs are not stored)
+--   ${SIDE}_long (p_utc, k, kpi, val, vmin, n)   one row per object, period and KPI with a value (NULLs are not stored);
+--                                          val = max and vmin = min of the n repeated values (equal when n = 1)
 -- p_utc is the period as timestamptz, k is the object key as text (key columns joined with |, NULL shown as <NULL>).
 CREATE OR REPLACE TEMP TABLE ${SIDE}_src AS
 SELECT ${P_EXPR} AS __p, ${K_EXPR} AS __k, *
@@ -19,7 +20,7 @@ WHERE table_name = '${SIDE}_src' AND database_name = 'temp'
   AND regexp_matches(column_name, '${SIDE_KPI_REGEX}');
 
 CREATE OR REPLACE TEMP TABLE ${SIDE}_long AS
-SELECT p_utc, k, kpi, max(v) AS val, count(*) AS n
+SELECT p_utc, k, kpi, max(v) AS val, min(v) AS vmin, count(*) AS n
 FROM (
   SELECT __p AS p_utc, __k AS k, kpi, CAST(val AS DOUBLE) AS v
   FROM (UNPIVOT ${SIDE}_src ON COLUMNS('${SIDE_KPI_REGEX}') INTO NAME kpi VALUE val)

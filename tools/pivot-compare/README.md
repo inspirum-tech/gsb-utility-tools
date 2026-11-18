@@ -99,12 +99,20 @@ Files in `REPORT_DIR` (all rewritten on every run):
 | `objects_one_side.csv` | objects (period + key) that exist on one side only, with the side |
 | `kpi_columns_one_side.csv` | KPI columns that exist on one side only |
 | `kpi_summary.csv` | per KPI: compared, equal, different, null on one side, largest difference |
-| `duplicate_keys.csv` | objects (or object and KPI) that appear more than once on a side; values are reduced with `max()` |
+| `duplicate_keys.csv` | objects (or object and KPI) that appear more than once on a side; values are reduced with `max()`. Columns `conflicting` (yes when the repeated rows hold different values), `min_value`, `max_value` |
+| `period_summary.csv` | one line per 15-minute period found on either side: `period_present` (`both`, `OLD only`, `NEW only`), objects per side and in both, values compared, equal, different, empty on one side |
 | `generated.sql`, `config_used.env` | exactly what ran (no connection strings) |
 
 **The verdict.** `DIFFERENT` if any value differs, or (switches in the config) objects exist on one side only,
-KPI columns exist on one side only, or a value is NULL on one side only. `IDENTICAL` only when none of that is
-found *and* there is something in common. Nothing in common is `NOT COMPARABLE`, never `IDENTICAL`.
+KPI columns exist on one side only, a value is NULL on one side only, or a repeated row has conflicting values
+(`FAIL_ON_DUPLICATES`). `IDENTICAL` only when none of that is found *and* there is something in common. Nothing in
+common is `NOT COMPARABLE`, never `IDENTICAL`. The verdict line also states the period coverage
+(`periods on both sides=4 only old=0 only new=0`) and the repeated rows (`duplicate entries=N conflicting=M`).
+
+**Repeated rows.** When one side holds the same object and period more than once, the values are reduced with `max()`.
+That can hide a difference (OLD rows 10 and 12 against NEW 12 look equal). So such rows are listed in `duplicate_keys.csv`
+and marked `conflicting` when their values differ. `FAIL_ON_DUPLICATES=conflicting` (default) makes the verdict `DIFFERENT`
+for a conflicting repeat, `yes` for any repeat, `no` only lists them.
 
 **Value rules** (same as the Java calculator, all configurable):
 
@@ -130,13 +138,19 @@ Supporting_details/                  copy of the raw report folder (duplicate_ke
 
 The whole folder is also written as one zip next to it (`<REPORT_DIR>_FINAL_OUTPUT_RESULT.zip`), so there is one file to download.
 
-* **Status** per table: `PASS` only with 0 different values, nothing on one side only, nothing empty on one side and no KPI column
-  on one side only. Otherwise `NOT MET`, with the numbers in the comment. The column "All paired values equal?" shows the
-  tables whose paired values are all equal even when objects are missing on one side.
+* **Status** per table: `PASS` only with 0 different values, nothing on one side only, nothing empty on one side, no KPI column
+  on one side only, no period on one side only and no repeated row with conflicting values. It is worked out from the numbers
+  of the run, whatever the `FAIL_ON_*` switches were (those only set the exit code). Otherwise `NOT MET`, with the numbers in
+  the comment.
+* **% equal** = values equal / values compared, where "values compared" = common objects x common KPI columns. A value that is
+  empty on one side counts as NOT equal. The column "All paired values equal?" is `Yes` only when different values and values
+  empty on one side are both 0 (it does not cover objects found on one side only).
 * Everything numeric (counts, KPIs with different values, keys, period, tolerance) is built from the run itself. What a person
   has confirmed (out of scope, variations, observations, open items, conclusion) comes from the optional `FINAL_REPORT_NOTES_FILE`
   and `FINAL_REPORT_COMMENTS_FILE`; without them those chapters say "None recorded for this run". Example files:
-  `docs/final_report_notes_dev_20261105.md`, `docs/final_report_comments_dev_20261105.csv`.
+  `docs/final_report_notes_dev_20261105.md`, `docs/final_report_comments_dev_20261105.csv`. The shipped `config_ns_all.env`
+  leaves both empty, so a UAT or prod report holds only what that run measured; `config_ns_all_dev.env` is the dev copy that
+  points at the dev files.
 * Needs `python3` (standard library only). Without it a message is printed; the comparison result and exit code never change.
 * By hand: `python3 scripts/make_final_report.py REPORT_DIR OUT_DIR --title "NS Pivot Comparison" --notes notes.md`.
 * `config_used.env` of every table now ends with the values that table really used (`OLD_TABLE`, `NEW_TABLE`, key and info
