@@ -200,6 +200,7 @@ mkdir -p "$OUT_DIR"
 if [ "$RESUME" != yes ] && [ -n "$(ls -A "$OUT_DIR" 2>/dev/null)" ]; then
   die "$OUT_DIR already holds files: choose another --name, or set RESUME=yes to continue that run"
 fi
+rm -f "$OUT_DIR/___All_Errors.txt"   # left by an earlier failed attempt of this name; a new failure writes it again
 free="$(df -Pm "$OUT_ROOT" | awk 'NR==2{print $4}')"
 [ "${free:-0}" -ge "$MIN_FREE_MB" ] || die "OUT_ROOT has only ${free} MB free (MIN_FREE_MB=$MIN_FREE_MB)"
 

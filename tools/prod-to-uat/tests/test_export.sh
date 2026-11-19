@@ -106,7 +106,7 @@ LIST="$("$PY" -c "import zipfile,sys;print('\n'.join(sorted(zipfile.ZipFile(sys.
 has "zip root folder is the name" "$LIST" "nstd1/KPI_A_P/_manifest.csv"
 has "zip has a hyphen table" "$LIST" "nstd1/KPI_B-X_P/KPI_B-X_P_2026-10-25_03_00_00__to__2026-10-25_03_15_00.csv.gz"
 has "chunk 1 name" "$LIST" "nstd1/KPI_A_P/KPI_A_P_2026-10-25_00_00_00__to__2026-10-25_01_00_00.csv.gz"
-check "files in zip = 2 tables x (4 chunks + manifest)" "$(grep -c . <<<"$LIST")" 10
+check "files in zip = 2 tables x (4 chunks + manifest)" "$(grep -vc '/$' <<<"$LIST")" 10
 M="$(cat "$WORK/out/nstd1/KPI_A_P/_manifest.csv")"
 has "manifest header" "$M" "file,rows"
 has "manifest row" "$M" "KPI_A_P_2026-10-25_00_00_00__to__2026-10-25_01_00_00.csv.gz,2"
@@ -141,6 +141,8 @@ o="$(run --config "$WORK/c8.env" --name failed1 --tables KPI_A_P)"
 check "resume rc" "$(rc "$o")" 0
 has "resume skips the done chunks" "$o" "SKIP   KPI_A_P/KPI_A_P_2026-10-25_00_00_00__to__2026-10-25_01_00_00.csv.gz exists (rows=2)"
 has "resume total rows" "$o" "RESULT_ROWS=8"
+check "resume: old errors file removed from the folder" "$([ -e "$WORK/out/failed1/___All_Errors.txt" ] && echo yes || echo no)" no
+check "resume: errors file not inside the zip" "$("$PY" -c "import zipfile,sys;print(sum('All_Errors' in n for n in zipfile.ZipFile(sys.argv[1]).namelist()))" "$WORK/out/failed1.zip")" 0
 
 # ---- 7. daylight saving: chunks are plain wall-clock text ------------------------------------------------------------------------
 o="$(TZ=Australia/Sydney run --config "$WORK/c1.env" --name dst1 --tables KPI_A_P --from 2026-10-03 --to 2026-10-05)"
