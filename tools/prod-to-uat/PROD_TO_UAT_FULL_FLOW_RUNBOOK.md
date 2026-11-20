@@ -231,7 +231,7 @@ vi configs/nstd_prod_to_uat.env
 | `COMPARE` | `yes` runs pivot-compare after the load. `no` skips it | `yes` | you want or do not want the comparison | the step list at the top of `--check` |
 | `PIVOT_COMPARE_DIR` | the pivot-compare folder (default: `../pivot-compare`) | | elsewhere | |
 | `PIVOT_COMPARE_CONFIG` | the pivot-compare config (section 5.4) | `.../pivot-compare/nstd_compare.env` | a new comparison | `--check` says `pivot-compare config ...` |
-| `STEPS` (optional) | run only some steps, e.g. `copy,load,compare` (also `--steps`) | | a re-run | |
+| `STEPS` (optional) | which steps run, from `export,copy,load,compare` (default: all four). `--steps` on the command line overrides it for one run. The `compare` step runs only when `COMPARE="yes"` as well. See section 8, "Run only part of the flow" | `export,copy,load` | you want only part of the flow | the step list at the top of `--check` |
 | `MIN_FREE_MB` (optional) | free disk needed besides the zip, on UAT and prod | `1024` | big zips | |
 | `REPORT_DIR` (optional) | where the run reports go (default `./reports`) | | | |
 
@@ -453,6 +453,8 @@ A table is `PASS` in the Word report only when nothing differs, nothing exists o
 
 ## 8. Change the job: what to edit for what you want
 
+**Run only part of the flow.** The steps always run in this order: `export`, `copy`, `load`, `compare`. You choose which ones run, with `--steps` (one run) or `STEPS` in the run-all config (every run). A later step on its own needs `--name <zip name>` (the zip name is in the earlier run's `summary.txt`) so it finds the zip. Run `--check` with the same `--steps` first: it checks only the chosen steps. A `--dry-run` never runs the comparison.
+
 | I want to | Edit this | In this file | Then verify with |
 |---|---|---|---|
 | Export **another application** (a different set of tables) | `TABLES`, `ZIP_NAME_PREFIX`; add the table pairs to a pairs file | run-all config; pairs file | `--check` shows one `OK` line per table |
@@ -466,7 +468,10 @@ A table is `PASS` in the Word report only when nothing differs, nothing exists o
 | Load into **another UAT schema** | `TARGET_SCHEMA`, `BACKUP_SCHEMA` in the db-import config; `OLD_SCHEMA` in the compare config (the same value) | db-import config; compare config | `--check`; the compare `OLD_SCHEMA` equals `TARGET_SCHEMA` |
 | Load into a **new schema or new tables** (the first time) | `TARGET_STRUCTURE="create"`, then back to `strict` | db-import config | `--check` lists what will be created |
 | **Skip the comparison** | `COMPARE="no"` | run-all config | the step list shows no `compare` |
-| **Compare only** (data already loaded) | `./run-all.sh configs/<job>.env --name <zip name> --steps compare` (set a **new** `REPORT_DIR` in the compare config first) | command line | `pairs_summary.csv` |
+| **Export + copy only** (the zip arrives on UAT, nothing is loaded) | `./run-all.sh configs/<job>.env --steps export,copy` | command line | the zip and its `.sha256` are in `LOCAL_ZIP_DIR`; `summary.txt` |
+| **Export + copy + load, no comparison** | `./run-all.sh configs/<job>.env --steps export,copy,load`, or set `STEPS="export,copy,load"` (or `COMPARE="no"`) in the run-all config | command line or run-all config | the step list shows no `compare` |
+| **Load only** (the zip is already on UAT) | `./run-all.sh configs/<job>.env --name <zip name> --steps load` | command line | `--check` finds the zip; the load log shows the row counts |
+| **Compare only** (data already loaded) | `./run-all.sh configs/<job>.env --name <zip name> --steps compare` (needs `COMPARE="yes"`; set a **new** `REPORT_DIR` in the compare config first) | command line | `pairs_summary.csv` |
 | Run **one step again** | `./run-all.sh configs/<job>.env --name <zip name> --steps <step>` | command line | `summary.txt` |
 | The **report title or author** | `FINAL_REPORT_TITLE`, `FINAL_REPORT_AUTHOR` | compare config | the Word report |
 | Skip the "Start? type yes" question (a scheduled run) | add `--yes` | command line | |
