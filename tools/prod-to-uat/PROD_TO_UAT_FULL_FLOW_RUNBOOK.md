@@ -314,6 +314,13 @@ REPORT_DIR="/tmp/dbimport_reports_<your user>"
 | `REPORT_DIR` | where db-import writes its run folders. **Use a folder you can write to** | | |
 | `EXTRA_SOURCE_COLUMNS` | do **not** set it together with `TARGET_STRUCTURE="create"` (the load refuses) | | |
 
+For a preinstalled UAT DuckDB, keep `OFFLINE="yes"` and set these in the **db-import** config. For CSV imports this replaces the bundle entirely; no VERSION file, symlinks or downloads are needed. Without `DUCKDB_EXTENSION_DIR` the original bundle workflow still applies.
+
+```bash
+DUCKDB="/apps/moosefs/mount/software/duckdb/cli/1.5.5/duckdb"
+DUCKDB_EXTENSION_DIR="/apps/moosefs/mount/software/duckdb/extension"
+```
+
 ### 5.4 UAT: the pivot-compare config and the pairs file
 
 Make copies; never edit the shipped files. Use the shipped `config_ns_all.env` (**not** `config_ns_all_dev.env`: that one holds dev notes).

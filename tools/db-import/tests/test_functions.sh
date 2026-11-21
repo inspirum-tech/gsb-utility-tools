@@ -110,6 +110,7 @@ BK_NAME=("KPI_X_bak_20261112_101500"); LOAD_MODE=replace; DRY_RUN=no
 DK="$(build_duck_sql 0)"
 has "duck: stop at first error"  ".bail on" "$DK"
 has "duck: bundle extension dir" "SET extension_directory='/opt/db-import/bundle/extensions';" "$DK"
+has "duck: direct extension root" "SET extension_directory='/site/extension';" "$(DUCKDB_EXTENSION_DIR=/site/extension build_duck_sql 0)"
 has "duck: no auto download"     "SET autoinstall_known_extensions=false;" "$DK"
 has "duck: UTC by default"       "SET TimeZone='UTC';" "$DK"
 TIMEZONE=Australia/Sydney

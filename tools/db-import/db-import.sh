@@ -275,7 +275,7 @@ duck_head() { # the start of every DuckDB script
     local out=".bail on
 " ext
     if [ "$OFFLINE" = yes ]; then
-        out+="SET extension_directory='$(sqlq "$BUNDLE_DIR/extensions")';
+        out+="SET extension_directory='$(sqlq "${DUCKDB_EXTENSION_DIR:-$BUNDLE_DIR/extensions}")';
 SET autoinstall_known_extensions=false;
 SET autoload_known_extensions=false;
 "
@@ -346,7 +346,7 @@ duck_version_of() { "$1" -init /dev/null --version 2>/dev/null | head -1 | awk '
 
 setup_duck() {
     DUCK_BIN="$DUCKDB"
-    if [ -x "$BUNDLE_DIR/duckdb" ]; then DUCK_BIN="$BUNDLE_DIR/duckdb"; fi
+    if [ -z "${DUCKDB_EXTENSION_DIR:-}" ] && [ -x "$BUNDLE_DIR/duckdb" ]; then DUCK_BIN="$BUNDLE_DIR/duckdb"; fi
     command -v "$DUCK_BIN" >/dev/null 2>&1 || [ -x "$DUCK_BIN" ] \
         || die "DuckDB CLI not found ('$DUCK_BIN'). Set DUCKDB=<path> in the config, or run prepare-bundle.sh on dev and copy bundle/ here."
     DUCK_EXTS=""
@@ -358,6 +358,14 @@ setup_duck() {
     log "DuckDB: $DUCK_BIN ($(duck_version_of "$DUCK_BIN")); extensions needed: ${DUCK_EXTS:-none}"
     [ "$OFFLINE" = yes ] || { warn "OFFLINE=no: DuckDB may download extensions (only for a machine with internet)"; return 0; }
 
+    if [ -n "${DUCKDB_EXTENSION_DIR:-}" ]; then
+        [[ "$DUCKDB_EXTENSION_DIR" = /* && -d "$DUCKDB_EXTENSION_DIR" ]] || die "DUCKDB_EXTENSION_DIR must be an existing absolute extension root (above vX.Y.Z/)"
+        local probe=".bail on" ext
+        probe+=$'\n'"SET extension_directory='$(sqlq "$DUCKDB_EXTENSION_DIR")'; SET autoinstall_known_extensions=false; SET autoload_known_extensions=false;"
+        for ext in $DUCK_EXTS; do probe+=$'\n'"LOAD $ext;"; done
+        duck_run "$probe" >/dev/null || die "Cannot load installed extensions using $DUCK_BIN and $DUCKDB_EXTENSION_DIR (check version, platform and permissions)"
+        return 0
+    fi
     [ -d "$BUNDLE_DIR/extensions" ] && [ -f "$BUNDLE_DIR/VERSION" ] \
         || die "offline bundle not found in $BUNDLE_DIR. On a machine with internet run ./prepare-bundle.sh and copy the bundle/ folder next to this script (README, 'Offline')."
     if [ -f "$BUNDLE_DIR/SHA256SUMS" ]; then
@@ -932,6 +940,7 @@ validate_config() {
     case "$LOAD_MODE" in replace|append|stop) ;; *) die "LOAD_MODE must be replace, append or stop";; esac
     case "$BACKUP" in on|off) ;; *) die "BACKUP must be on or off";; esac
     case "$ON_ERROR" in stop|continue) ;; *) die "ON_ERROR must be stop or continue";; esac
+    [ -z "${DUCKDB_EXTENSION_DIR:-}" ] || [ "$OFFLINE" = yes ] || die "DUCKDB_EXTENSION_DIR requires OFFLINE=yes"
     case "$OFFLINE" in yes|no) ;; *) die "OFFLINE must be yes or no";; esac
     if [ "$SOURCE_TYPE" = flightsql ]; then
         local n
