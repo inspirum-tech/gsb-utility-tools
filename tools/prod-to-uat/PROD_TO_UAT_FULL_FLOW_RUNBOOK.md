@@ -260,6 +260,8 @@ vi configs/nstd_prod_to_uat.env
 | `REPORT_DIR` (optional) | where the run reports go (default `./reports`) | | | |
 
 Rules checked at start: names use letters, digits, `_` and `-`; **paths must not contain spaces** (letters, digits and `_ . / : @ + -` only).
+On a real copy, the verified UAT ZIP is published and synced before the matching prod ZIP is removed. Prod CSV staging and `.zip.sha256` remain. On a load failure retry with `--name <same-name> --steps load` using the UAT copy. A checksum or publication failure leaves the prod ZIP intact. For an interrupted cleanup inspect `<zip>.cleanup.*` on prod before retrying. Dry-run retains the prod ZIP.
+
 A zip name that already exists on prod or on UAT is refused: nothing is overwritten.
 
 ### 5.3 UAT: the db-import config `db-import/configs/<job>_load.env`

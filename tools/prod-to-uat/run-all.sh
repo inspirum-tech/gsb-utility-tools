@@ -230,7 +230,7 @@ step_export() {
   [ -n "$ZIP_SHA" ] || { log "ERROR  the export did not report a checksum"; return 1; }
 }
 step_copy() {
-  local want size_mb free tmp="$LOCAL_ZIP_DIR/.tmp_$ZIP_NAME.zip" got
+  local want size_mb free tmp got
   [ ! -e "$LOCAL_ZIP" ] || { log "ERROR  $LOCAL_ZIP already exists (nothing is overwritten; choose another --name)"; return 1; }
   want="${ZIP_SHA:-$(remote cat "$REMOTE_ZIP.sha256" | cut -d' ' -f1)}"
   [[ "$want" =~ ^[0-9a-f]{64}$ ]] || { log "ERROR  cannot read the checksum of $REMOTE_ZIP on prod (was the export finished?)"; return 1; }
@@ -238,12 +238,32 @@ step_copy() {
   free="$(free_mb "$LOCAL_ZIP_DIR")"
   if [ "${free:-0}" -lt $(( size_mb + MIN_FREE_MB )) ]; then log "ERROR  $LOCAL_ZIP_DIR has ${free} MB free; the zip is ${size_mb} MB and MIN_FREE_MB=$MIN_FREE_MB"; return 1; fi
   log "COPY   $REMOTE_ZIP (${size_mb} MB) -> $LOCAL_ZIP"
-  rm -f "$tmp"
+  tmp="$(mktemp -- "$LOCAL_ZIP_DIR/.tmp_$ZIP_NAME.XXXXXXXX")" || return 1
   fetch "$REMOTE_ZIP" "$tmp" || { rm -f "$tmp"; log "ERROR  the copy failed"; return 1; }
   got="$(sha_of "$tmp")"
   if [ "$got" != "$want" ]; then rm -f "$tmp"; log "ERROR  the copy is damaged: checksum $got, expected $want. It was removed."; return 1; fi
-  mv -f "$tmp" "$LOCAL_ZIP"; ZIP_SHA="$want"
+  # Publish without overwriting a concurrent copy; sync before releasing the source.
+  ln -T -- "$tmp" "$LOCAL_ZIP" || { rm -f -- "$tmp"; log "ERROR  cannot publish $LOCAL_ZIP; source retained"; return 1; }
+  rm -f -- "$tmp" || return 1
+  sync -f "$LOCAL_ZIP" || { log "ERROR  cannot sync UAT zip; source retained"; return 1; }
+  ZIP_SHA="$want"
   log "OK     copied, checksum $want matches"
+  [ "$DRY" -eq 0 ] || return 0
+  # Claim the exact file by rename before checking it, never unlink a replacement by pathname.
+  remote bash -c '
+    set -eu
+    archive=$1; want=$2
+    hold=$(mktemp -d -- "${archive}.cleanup.XXXXXXXX")
+    mv -T -- "$archive" "$hold/archive" || { rmdir -- "$hold"; exit 1; }
+    if [ -f "$hold/archive" ] && [ ! -L "$hold/archive" ] && actual=$(sha256sum < "$hold/archive") && [ "${actual%% *}" = "$want" ]; then
+      rm -- "$hold/archive" && rmdir -- "$hold"
+    else
+      # Restore without clobbering a new export. Preserve both files on a collision.
+      mv -nT -- "$hold/archive" "$archive"
+      if [ -e "$hold/archive" ] || [ -L "$hold/archive" ]; then printf "Source retained at %s/archive\n" "$hold" >&2; else rmdir -- "$hold"; fi
+      exit 1
+    fi' _ "$REMOTE_ZIP" "$want" || { log "ERROR  prod ZIP cleanup not confirmed; verified UAT ZIP retained. Inspect prod before retrying --steps load."; return 1; }
+  log "OK     removed verified prod ZIP $REMOTE_ZIP (CSV staging and checksum retained)"
 }
 step_load() {
   local cfg flags=() rc=0

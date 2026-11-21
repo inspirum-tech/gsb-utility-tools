@@ -127,9 +127,9 @@ has "copy step ok" "$o" "OK     step copy finished"
 has "load step ok" "$o" "OK     step load finished"
 has "compare step ok" "$o" "OK     step compare finished"
 has "checksum matches" "$o" "matches"
-check "zip on prod" "$([ -s "$WORK/prod_out/run1.zip" ] && echo yes || echo no)" yes
+check "verified source zip removed" "$([ -s "$WORK/prod_out/run1.zip" ] && echo yes || echo no)" no
 check "zip on UAT" "$([ -s "$WORK/uat_zips/run1.zip" ] && echo yes || echo no)" yes
-check "the two zips are identical" "$(sha256sum < "$WORK/prod_out/run1.zip")" "$(sha256sum < "$WORK/uat_zips/run1.zip")"
+check "the two zips are identical" "$(cut -d" " -f1 "$WORK/prod_out/run1.zip.sha256")" "$(sha256sum < "$WORK/uat_zips/run1.zip" | cut -d" " -f1)"
 L="$(cat "$DBI_LOG")"
 has "db-import was checked first" "$L" "ARGS: --check "
 has "db-import then ran for real with --yes" "$L" "ARGS: --yes "
@@ -185,6 +185,7 @@ o="$(run --yes "$WORK/a.env" --name nosuch --steps load)";  check "load without 
 o="$(run --yes --dry-run "$WORK/a.env" --name dry1)"
 check "dry run rc" "$(rc "$o")" 0
 has "dry run: db-import --dry-run" "$(cat "$DBI_LOG")" "ARGS: --dry-run --yes"
+check "dry run retains prod zip" "$([ -s "$WORK/prod_out/dry1.zip" ] && echo yes)" yes
 hasnt "dry run: no compare" "$o" "===== step: compare"
 o="$(PC_RC=1 run --yes "$WORK/a.env" --name cmp1)";          check "compare DIFFERENT -> exit 3" "$(rc "$o")" 3; has "different msg" "$o" "comparison says DIFFERENT"
 o="$(PC_RC=3 run --yes "$WORK/a.env" --name cmp2)";          check "compare NOT COMPARABLE -> exit 4" "$(rc "$o")" 4
@@ -197,6 +198,7 @@ o="$(run --yes "$WORK/a.env" --name dmg1 --steps export)"
 echo "tampered" >> "$WORK/prod_out/dmg1.zip"                # the zip on prod no longer matches its .sha256
 o="$(run --yes "$WORK/a.env" --name dmg1 --steps copy)"
 check "damaged copy: rc" "$(rc "$o")" 1
+check "bad checksum retains prod zip" "$([ -s "$WORK/prod_out/dmg1.zip" ] && echo yes)" yes
 has "damaged copy msg" "$o" "the copy is damaged"
 check "damaged copy removed" "$(ls "$WORK/uat_zips" | grep -c 'dmg1')" 0
 
