@@ -8,7 +8,7 @@ loads it into the UAT DuckLake, and compares it with the new calculator's output
 ```
 UAT   ./run-all.sh configs/<job>.env
         1 EXPORT   logs in to prod over SSH and runs export-on-prod.sh there (next to the data)
-                   prod Postgres tables -> hourly .csv.gz files + _manifest.csv -> ONE zip + its .sha256
+                   prod PostgreSQL and/or DuckLake tables -> hourly .csv.gz files + _manifest.csv -> ONE zip + its .sha256
         2 COPY     scp copies the zip to UAT and checks the checksum
         3 LOAD     db-import checks the zip, backs up the old rows, replaces the rows of the period in the UAT DuckLake
         4 COMPARE  pivot-compare compares the loaded prod data (OLD) with the new calculator's output (NEW)
@@ -41,7 +41,7 @@ The load replaces those rows in the UAT DuckLake (the old rows are saved in a ba
 
 | Part | Runs on | What it is | You create or edit it? |
 |---|---|---|---|
-| `export-on-prod.sh` | PROD | reads the Postgres pivot tables, writes the zip | upload once |
+| `export-on-prod.sh` | PROD | reads the selected PostgreSQL/DuckLake tables, writes the zip | upload once |
 | `export.env` | PROD | the prod database connection (no password) | create once from `export.example.env` |
 | `~/.pgpass` | PROD | the prod database password | create once |
 | `run-all.sh` | UAT | the one command that runs the four steps | upload once |
@@ -87,6 +87,30 @@ What each machine needs installed:
 | UAT | the DuckDB program for pivot-compare, and `~/.duckdbrc` that attaches the DuckLake catalog | step 4.5 |
 
 No internet is needed on any of them.
+
+## Mixed source jobs
+
+On UAT, replace the legacy `TABLES` setting with one or both qualified lists, for example:
+
+```bash
+POSTGRES_TABLES="pg_schema.PG_A,other_pg_schema.PG_B"
+DUCKLAKE_TABLES="lake_schema.LAKE_C"
+```
+
+Each entry identifies the logical source schema, not the DuckLake metadata schema. Table basenames must be unique across both lists; the existing ZIP importer identifies tables by their filenames. Legacy `TABLES` continues to use the single PostgreSQL `SCHEMA`.
+
+On prod, provision the DuckDB CLI and matching offline DuckLake/Postgres extensions for the SSH export account. Set `DUCKLAKE_INIT` in `export.env` to a trusted, protected init SQL file. It must attach the source lake as `gsb` read-only, for example (replace site-specific placeholders, use a local protected credential provider):
+
+```sql
+LOAD postgres;
+LOAD ducklake;
+ATTACH 'ducklake:postgres:host=HOST dbname=CATALOG user=READER' AS gsb
+  (READ_ONLY, METADATA_SCHEMA 'metadata', DATA_PATH '/prod/lake/data');
+```
+
+That account needs read access to the prod catalog and actual data files. Do not put credentials in the UAT job file. A DuckLake-only job does not query application tables via psql. No Flight SQL endpoint is used.
+
+Keep the existing UAT CSV load settings. For a new destination schema, set `TARGET_SCHEMA` and `TARGET_STRUCTURE="create"` in the db-import config. Review `CSV_COLUMN_TYPES` against source definitions: CSV does not carry types. Test one completed hour with `--check` then `--dry-run` before a real run.
 
 ## 3. One-time setup on PROD
 

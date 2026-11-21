@@ -40,7 +40,7 @@ cat > "$WORK/dbi/db-import.sh" <<'STUB'
 echo "ARGS: $*" >> "$DBI_LOG"
 cfg="${@: -1}"
 # shellcheck disable=SC1090
-( . "$cfg"; echo "ZIP: $SOURCE_CSV_PATH"; [ -f "$SOURCE_CSV_PATH" ] && echo "ZIP EXISTS" || echo "ZIP MISSING" ) >> "$DBI_LOG"
+( . "$cfg"; echo "SOURCE: $SOURCE_TYPE TARGET: $TARGET_TYPE"; echo "ZIP: $SOURCE_CSV_PATH"; [ -f "$SOURCE_CSV_PATH" ] && echo "ZIP EXISTS" || echo "ZIP MISSING" ) >> "$DBI_LOG"
 case " $* " in *" --check "*) [ -n "${DBI_FAIL_CHECK:-}" ] && exit 2 ;; esac
 [ -n "${DBI_FAIL:-}" ] && { echo "db-import: failed"; exit 1; }
 echo "db-import ok"; exit 0
@@ -199,6 +199,77 @@ o="$(run --yes "$WORK/a.env" --name dmg1 --steps copy)"
 check "damaged copy: rc" "$(rc "$o")" 1
 has "damaged copy msg" "$o" "the copy is damaged"
 check "damaged copy removed" "$(ls "$WORK/uat_zips" | grep -c 'dmg1')" 0
+
+# ---- 8. source-specific export lists: wrapper argument contract and unchanged CSV load ---------------------
+# Recording exporter isolates wrapper forwarding from the source exporters' database clients.
+cat > "$WORK/record-export.sh" <<'STUB'
+#!/usr/bin/env bash
+printf '%s\n' BEGIN "$@" END >> "$EXPORT_LOG"
+out=''; name=''; checking=0
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --out-root) out="$2"; shift 2 ;;
+    --name) name="$2"; shift 2 ;;
+    --check) checking=1; shift ;;
+    *) shift ;;
+  esac
+done
+[ "$checking" -eq 0 ] || exit 0
+mkdir -p "$out"
+python3 - "$out/$name.zip" <<'PY'
+import sys, zipfile
+with zipfile.ZipFile(sys.argv[1], 'w') as z:
+    z.writestr('KPI_A_P_202610250000.csv', 'PERIOD_START_TIME,SITE_ID,K_1\n2026-10-25 00:00:00,1,1.5\n')
+PY
+sha="$(sha256sum "$out/$name.zip" | cut -d' ' -f1)"
+printf '%s  %s\n' "$sha" "$name.zip" > "$out/$name.zip.sha256"
+printf 'RESULT_SHA256=%s\nRESULT_ROWS=1\n' "$sha"
+STUB
+export EXPORT_LOG="$WORK/export.log"
+for mode in postgres ducklake mixed; do
+  pg=''; dl=''
+  [ "$mode" = ducklake ] || pg='pg_schema.KPI_A_P,other.KPI_B_P'
+  [ "$mode" = postgres ] || dl='lake_schema.KPI_C_P'
+  mkcfg "$WORK/typed.env" 'TABLES=""' "POSTGRES_TABLES=\"$pg\"" "DUCKLAKE_TABLES=\"$dl\"" "PROD_EXPORT_SCRIPT=\"$WORK/record-export.sh\""
+  : > "$EXPORT_LOG"; : > "$DBI_LOG"
+  o="$(run --check "$WORK/typed.env" --name "typed_$mode")"
+  check "$mode check rc" "$(rc "$o")" 0
+  E="$(cat "$EXPORT_LOG")"
+  if [ -n "$pg" ]; then has "$mode check postgres forwarding" "$E" $'--postgres-tables\n'"$pg"; fi
+  if [ -n "$dl" ]; then has "$mode check lake forwarding" "$E" $'--ducklake-tables\n'"$dl"; fi
+  : > "$EXPORT_LOG"
+  o="$(run --yes "$WORK/typed.env" --name "typed_$mode")"
+  check "$mode chain rc" "$(rc "$o")" 0
+  E="$(cat "$EXPORT_LOG")"
+  hasnt "$mode no legacy flag" "$E" '--tables'
+  if [ -n "$pg" ]; then has "$mode postgres flag" "$E" $'--postgres-tables\n'"$pg"; else hasnt "$mode no postgres flag" "$E" '--postgres-tables'; fi
+  if [ -n "$dl" ]; then has "$mode ducklake flag" "$E" $'--ducklake-tables\n'"$dl"; else hasnt "$mode no ducklake flag" "$E" '--ducklake-tables'; fi
+  has "$mode downstream CSV source and target untouched" "$(cat "$DBI_LOG")" "SOURCE: csv TARGET: ducklake"
+  has "$mode downstream still CSV zip" "$(cat "$DBI_LOG")" "ZIP: $WORK/uat_zips/typed_$mode.zip"
+  hasnt "$mode downstream no source flags" "$(cat "$DBI_LOG")" '--postgres-tables'
+  hasnt "$mode downstream no lake flags" "$(cat "$DBI_LOG")" '--ducklake-tables'
+done
+
+# All invalid selections fail locally, before contacting the exporter (including --check).
+for extra in \
+  'POSTGRES_TABLES="s.A"' \
+  'DUCKLAKE_TABLES="s.A"' \
+  'TABLES=""; POSTGRES_TABLES="A"' \
+  'TABLES=""; DUCKLAKE_TABLES="catalog.s.A"' \
+  'TABLES=""; POSTGRES_TABLES="s.A,"' \
+  'TABLES=""; POSTGRES_TABLES=",s.A"' \
+  'TABLES=""; DUCKLAKE_TABLES="s.A,,s.B"' \
+  'TABLES=""; POSTGRES_TABLES="s.A;touch_bad"' \
+  'TABLES=""; POSTGRES_TABLES="s.A,other.a"' \
+  'TABLES=""; DUCKLAKE_TABLES="s.A,other.a"' \
+  'TABLES=""; POSTGRES_TABLES="s.A"; DUCKLAKE_TABLES="other.a"' \
+  'TABLES="A,a"'; do
+  mkcfg "$WORK/invalid.env" "PROD_EXPORT_SCRIPT=\"$WORK/record-export.sh\"" "$extra"
+  : > "$EXPORT_LOG"
+  o="$(run --check "$WORK/invalid.env")"
+  check "invalid selection $extra" "$(rc "$o")" 2
+  check "invalid selection never contacts exporter $extra" "$(wc -c < "$EXPORT_LOG" | tr -d ' ')" 0
+done
 
 echo "passed: $PASS   failed: $FAIL"
 [ "$FAIL" -eq 0 ]

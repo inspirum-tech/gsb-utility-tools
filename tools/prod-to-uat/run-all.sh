@@ -40,7 +40,8 @@ REMOTE_MODE="${REMOTE_MODE:-ssh}"                      # ssh | local (local = th
 PROD_SSH_HOST="${PROD_SSH_HOST:-}"; PROD_SSH_USER="${PROD_SSH_USER:-}"; PROD_SSH_PORT="${PROD_SSH_PORT:-22}"
 PROD_SSH_KEY="${PROD_SSH_KEY:-}"; SSH_CONNECT_TIMEOUT="${SSH_CONNECT_TIMEOUT:-15}"
 PROD_EXPORT_SCRIPT="${PROD_EXPORT_SCRIPT:-}"; PROD_EXPORT_CONFIG="${PROD_EXPORT_CONFIG:-}"; PROD_OUT_ROOT="${PROD_OUT_ROOT:-}"
-TABLES="${TABLES:-}"; PERIOD_FROM="${PERIOD_FROM:-}"; PERIOD_TO="${PERIOD_TO:-}"
+TABLES="${TABLES:-}"; POSTGRES_TABLES="${POSTGRES_TABLES:-}"; DUCKLAKE_TABLES="${DUCKLAKE_TABLES:-}"
+PERIOD_FROM="${PERIOD_FROM:-}"; PERIOD_TO="${PERIOD_TO:-}"
 ZIP_NAME_PREFIX="${ZIP_NAME_PREFIX:-$JOB_NAME}"
 LOCAL_ZIP_DIR="${LOCAL_ZIP_DIR:-}"
 DB_IMPORT_DIR="${DB_IMPORT_DIR:-$HERE/../db-import}"; DB_IMPORT_CONFIG="${DB_IMPORT_CONFIG:-}"
@@ -55,7 +56,49 @@ need() { [ -n "${!1}" ] || die "$1 is not set in $CONF"; }
 chk()  { [[ "${!1}" =~ $2 ]] || die "$1 has a character that is not allowed (got '${!1}')"; }
 [[ "$JOB_NAME" =~ $re_ident ]] || die "JOB_NAME must be letters, digits, _ or - only"
 case "$REMOTE_MODE" in ssh|local) ;; *) die "REMOTE_MODE must be ssh or local" ;; esac
-need PROD_EXPORT_SCRIPT; need PROD_EXPORT_CONFIG; need PROD_OUT_ROOT; need TABLES; need PERIOD_FROM; need PERIOD_TO; need LOCAL_ZIP_DIR; need DB_IMPORT_CONFIG
+need PROD_EXPORT_SCRIPT; need PROD_EXPORT_CONFIG; need PROD_OUT_ROOT; need PERIOD_FROM; need PERIOD_TO; need LOCAL_ZIP_DIR; need DB_IMPORT_CONFIG
+# Typed lists identify their source explicitly. Never guess which source legacy TABLES belongs to.
+declare -a EXPORT_TABLE_ARGS=()
+declare -A TABLE_BASENAMES=()
+validate_tables() {
+  local kind="$1" list="$2" t base key
+  local -a entries=()
+  if [ "$kind" != TABLES ]; then
+    [[ "$list" != ,* && "$list" != *, && "$list" != *,,* ]] || die "$kind must be a comma list of schema.table names (no empty entries)"
+  fi
+  IFS=, read -r -a entries <<< "$list"
+  # read handles one line only: multiline input is not a comma-separated selection.
+  [[ "$list" != *$'\n'* ]] || die "$kind must be a single comma-separated list"
+  for t in "${entries[@]}"; do
+    if [ "$kind" = TABLES ]; then
+      t="${t//[$' \t\r']/}"; [ -n "$t" ] || continue
+      [[ "$t" =~ ^[A-Za-z0-9_-]+$ ]] || die "TABLES entry '$t' must be an unqualified table name"
+    else
+      [[ "$t" =~ ^[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+$ ]] || die "$kind entry '$t' must be explicitly qualified as schema.table"
+    fi
+    base="${t##*.}"; key="${base,,}"
+    [ -z "${TABLE_BASENAMES[$key]:-}" ] || die "table basename collision (case-insensitive): '$t' and '${TABLE_BASENAMES[$key]}'"
+    TABLE_BASENAMES[$key]="$t"
+  done
+}
+if [ -n "$POSTGRES_TABLES$DUCKLAKE_TABLES" ]; then
+  [ -z "$TABLES" ] || die "TABLES cannot be combined with POSTGRES_TABLES or DUCKLAKE_TABLES (ambiguous legacy mixed mode)"
+  if [ -n "$POSTGRES_TABLES" ]; then
+    validate_tables POSTGRES_TABLES "$POSTGRES_TABLES"
+    EXPORT_TABLE_ARGS+=(--postgres-tables "$POSTGRES_TABLES")
+  fi
+  if [ -n "$DUCKLAKE_TABLES" ]; then
+    validate_tables DUCKLAKE_TABLES "$DUCKLAKE_TABLES"
+    EXPORT_TABLE_ARGS+=(--ducklake-tables "$DUCKLAKE_TABLES")
+  fi
+  TABLE_SELECTION="postgres: ${POSTGRES_TABLES:-<none>} | ducklake: ${DUCKLAKE_TABLES:-<none>}"
+else
+  [ -n "$TABLES" ] || die "TABLES is not set (or set POSTGRES_TABLES / DUCKLAKE_TABLES)"
+  validate_tables TABLES "$TABLES"
+  [ "${#TABLE_BASENAMES[@]}" -gt 0 ] || die "TABLES holds no table name"
+  EXPORT_TABLE_ARGS+=(--tables "$TABLES")
+  TABLE_SELECTION="$TABLES"
+fi
 for v in PROD_EXPORT_SCRIPT PROD_EXPORT_CONFIG PROD_OUT_ROOT LOCAL_ZIP_DIR; do chk "$v" "$re_path"; done
 if [ "$REMOTE_MODE" = ssh ]; then
   need PROD_SSH_HOST; need PROD_SSH_USER
@@ -113,7 +156,7 @@ fetch() {       # $1 remote file, $2 local file
   if [ "$REMOTE_MODE" = local ]; then cp "$1" "$2"
   else "$SCP_BIN" "${SCP_ARGS[@]}" "$PROD_SSH_USER@$PROD_SSH_HOST:$1" "$2"; fi
 }
-export_args() { printf '%s\n' --config "$PROD_EXPORT_CONFIG" --tables "$TABLES" --from "$PERIOD_FROM" --to "$PERIOD_TO" --name "$ZIP_NAME" --out-root "$PROD_OUT_ROOT"; }
+export_args() { printf '%s\n' --config "$PROD_EXPORT_CONFIG" "${EXPORT_TABLE_ARGS[@]}" --from "$PERIOD_FROM" --to "$PERIOD_TO" --name "$ZIP_NAME" --out-root "$PROD_OUT_ROOT"; }
 run_export() {  # $@ extra options for the export script
   local -a a=(); mapfile -t a < <(export_args)
   remote bash "$PROD_EXPORT_SCRIPT" "${a[@]}" "$@"
@@ -237,7 +280,7 @@ summary() {
     echo "job:        $JOB_NAME"
     echo "run:        $RUN_TS"
     echo "zip:        $ZIP_NAME   (prod: $REMOTE_ZIP)   (UAT: $LOCAL_ZIP)"
-    echo "tables:     $TABLES"
+    echo "tables:     $TABLE_SELECTION"
     echo "period:     $PERIOD_FROM  to  $PERIOD_TO"
     echo "checksum:   ${ZIP_SHA:--}    rows exported: ${ZIP_ROWS:--}"
     printf '%-9s %-8s %s\n' step status seconds
@@ -249,7 +292,7 @@ summary() {
 
 # ---- go ------------------------------------------------------------------------------------------------------------------------------
 log "BEGIN  job $JOB_NAME, zip $ZIP_NAME, steps: $(for s in export copy load compare; do [ -n "${WANT[$s]:-}" ] && printf '%s ' "$s"; done)$([ "$DRY" -eq 1 ] && echo '(DRY RUN: the load is rolled back, no compare)')"
-log "       tables: $TABLES"
+log "       tables: $TABLE_SELECTION"
 log "       period: $PERIOD_FROM to $PERIOD_TO"
 if [ "$ASSUME_YES" -eq 0 ] && [ -t 0 ]; then
   read -r -p "Start? type yes: " ans; [ "$ans" = yes ] || { log "stopped by the user: nothing was done"; exit 2; }
